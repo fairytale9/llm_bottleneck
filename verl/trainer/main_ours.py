@@ -259,8 +259,9 @@ class TaskRunner:
 
         # Add our custom translator worker for policy updates
         self.add_translator_worker(config)
-
+        
         # Load the reward manager for training and validation.
+        # The custom reward manager will be automatically loaded by load_reward_manager
         reward_fn = load_reward_manager(
             config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
         )

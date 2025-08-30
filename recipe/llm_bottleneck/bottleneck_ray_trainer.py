@@ -184,8 +184,6 @@ class RayLLMBottleneckTrainer(RayPPOTrainer):
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
-
-
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
@@ -199,12 +197,44 @@ class RayLLMBottleneckTrainer(RayPPOTrainer):
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
+                    # Translator worker compute log probabilities and update policy
+                    if hasattr(self, 'translator_wg') and self.translator_wg is not None:
+                        with marked_timer("translator_update", timing_raw, color="orange"):
+                            try:
+                                # Compute log probabilities of y* using our translator worker
+                                translator_logp = self.translator_wg.compute_log_prob(batch)
+                                batch.batch["m_logp"] = translator_logp.batch["log_probs"]
+                                
+                                # Call the translator worker's update function to perform policy updates
+                                if hasattr(self.translator_wg, 'update_policy'):
+                                    update_result = self.translator_wg.update_policy(batch)
+                                    
+                                    # Add any metrics from the update if available
+                                    if hasattr(update_result, 'meta_info') and 'metrics' in update_result.meta_info:
+                                        translator_metrics = update_result.meta_info['metrics']
+                                        metrics.update({f"translator/{k}": v for k, v in translator_metrics.items()})
+                                
+                                # log metrics for translator
+                                m_logp = batch.batch["m_logp"]
+                                avg_logp = m_logp.mean().item()
+                                std_logp = m_logp.std().item()
+                                
+                                # Add metrics for monitoring
+                                metrics.update({
+                                    "translator/avg_logp": avg_logp,
+                                    "translator/std_logp": std_logp,
+                                    "translator/logp_shape": list(m_logp.shape)
+                                })
+                                    
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm:
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
 
+                        # Compute rewards using the configured reward manager
+                        # The custom reward manager will automatically access batch.batch["m_logp"]
+                        # when it's available (after the translator worker computes it)
                         if self.config.reward_model.launch_reward_fn_async:
                             future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
                         else:
@@ -293,71 +323,6 @@ class RayLLMBottleneckTrainer(RayPPOTrainer):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
-
-                    # === LLM Bottleneck: Update Translator Worker ===
-                    # This is where we can add custom logic for our TranslatorWorker
-                    # For example, we could call the translator worker to perform policy updates
-                    # or compute additional metrics
-                    if hasattr(self, 'translator_wg') and self.translator_wg is not None:
-                        with marked_timer("translator_update", timing_raw, color="orange"):
-                            try:
-                                # === Step 1: Compute Log Probabilities ===
-                                # Compute log probabilities using our translator worker
-                                translator_logp = self.translator_wg.compute_log_prob(batch)
-                                
-                                # Store the log probabilities in the batch
-                                if "log_probs" in translator_logp.batch:
-                                    batch.batch["m_logp"] = translator_logp.batch["log_probs"]
-                                    print(f"✓ TranslatorWorker computed log probabilities, shape: {batch.batch['m_logp'].shape}")
-                                else:
-                                    print("⚠ TranslatorWorker log_probs not found in output")
-                                    # Create a placeholder tensor if computation fails
-                                    batch_size = len(batch.batch["input_ids"])
-                                    seq_len = batch.batch["input_ids"].shape[1]
-                                    batch.batch["m_logp"] = torch.zeros(batch_size, seq_len, device=batch.batch["input_ids"].device)
-                                
-                                # === Step 2: Update Translator Worker ===
-                                # Call the translator worker's update function to perform policy updates
-                                if hasattr(self.translator_wg, 'update_policy'):
-                                    update_result = self.translator_wg.update_policy(batch)
-                                    print(f"✓ TranslatorWorker policy update completed")
-                                    
-                                    # Add any metrics from the update if available
-                                    if hasattr(update_result, 'meta_info') and 'metrics' in update_result.meta_info:
-                                        translator_metrics = update_result.meta_info['metrics']
-                                        metrics.update({f"translator/{k}": v for k, v in translator_metrics.items()})
-                                else:
-                                    print("ℹ TranslatorWorker update_policy method not available")
-                                
-                                # === Step 3: Log Statistics ===
-                                # Log some statistics about the computed log probabilities
-                                if "m_logp" in batch.batch:
-                                    m_logp = batch.batch["m_logp"]
-                                    avg_logp = m_logp.mean().item()
-                                    std_logp = m_logp.std().item()
-                                    
-                                    # Add metrics for monitoring
-                                    metrics.update({
-                                        "translator/avg_logp": avg_logp,
-                                        "translator/std_logp": std_logp,
-                                        "translator/logp_shape": list(m_logp.shape)
-                                    })
-                                    
-                                    print(f"✓ TranslatorWorker log probabilities - Avg: {avg_logp:.4f}, Std: {std_logp:.4f}")
-                                
-                                # You can add more custom logic here, such as:
-                                # - Computing additional metrics
-                                # - Performing additional policy updates based on log probabilities
-                                
-                            except Exception as e:
-                                print(f"Warning: Translator worker update failed: {e}")
-                                # Create a placeholder tensor if computation fails
-                                try:
-                                    batch_size = len(batch.batch["input_ids"])
-                                    seq_len = batch.batch["input_ids"].shape[1]
-                                    batch.batch["m_logp"] = torch.zeros(batch_size, seq_len, device=batch.batch["input_ids"].device)
-                                except:
-                                    pass
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
