@@ -1,4 +1,4 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,12 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .critic import *  # noqa
-from .actor import *  # noqa
-from .engine import *  # noqa
-from .optimizer import *  # noqa
-from .rollout import *  # noqa
-from .model import *  # noqa
-from . import actor, critic, engine, optimizer, rollout, model
+from .base import BasePPOTranslator
+from .dp_translator import DataParallelPPOTranslator
 
-__all__ = actor.__all__ + critic.__all__ + engine.__all__ + optimizer.__all__ + rollout.__all__ + model.__all__
+__all__ = ["BasePPOTranslator", "DataParallelPPOTranslator"]

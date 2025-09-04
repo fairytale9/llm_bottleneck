@@ -11,7 +11,7 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.shuffle=False \
-    actor_rollout_ref.model.path=Qwen/Qwen2.5-3B-Instruct \
+    actor_rollout_ref.model.path=$HOME/model/qwen_math_1.5b \
     actor_rollout_ref.model.use_shm=True \
     actor_rollout_ref.model.lora_rank=64 \
     actor_rollout_ref.model.lora_alpha=32 \
@@ -40,7 +40,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.logger='["console","wandb"]' \
     trainer.project_name='verl_grpo_example_gsm8k' \
     trainer.experiment_name='qwen2.5_3b_grpo_lora' \
-    trainer.n_gpus_per_node=8 \
+    trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
     trainer.test_freq=5 \

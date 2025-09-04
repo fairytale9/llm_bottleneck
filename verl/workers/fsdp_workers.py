@@ -1699,6 +1699,455 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         output = output.to("cpu")
         return output
 
+class TranslatorWorker(Worker, DistProfilerExtension):
+    def __init__(self, config):
+        Worker.__init__(self)
+        omega_profiler_config = config.get("profiler", {})
+        profiler_config = omega_conf_to_dataclass(omega_profiler_config, dataclass_type=ProfilerConfig)
+        if omega_profiler_config.get("tool", None) in ["npu", "nsys", "torch"]:
+            tool_config = omega_conf_to_dataclass(
+                omega_profiler_config.get("tool_config", {}).get(omega_profiler_config.get("tool"))
+            )
+        else:
+            tool_config = None
+        DistProfilerExtension.__init__(
+            self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config)
+        )
+        import torch.distributed
+
+        self.config = config
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(
+                backend=get_nccl_backend(),
+                timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
+                init_method=os.environ.get("DIST_INIT_METHOD", None),
+            )
+
+        # build device mesh for Ulysses Sequence Parallel
+        world_size = torch.distributed.get_world_size()
+        from torch.distributed.device_mesh import init_device_mesh
+
+        fsdp_size = self.config.model.fsdp_config.fsdp_size
+        self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=fsdp_size)
+
+        self.ulysses_device_mesh = None
+        self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
+        dp = world_size // self.ulysses_sequence_parallel_size
+        if self.ulysses_sequence_parallel_size > 1:
+            self.ulysses_device_mesh = init_device_mesh(
+                device_name, mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"]
+            )
+
+        # create training dispatch
+        if self.ulysses_device_mesh is not None:
+            is_collect = self.ulysses_device_mesh["sp"].get_local_rank() == 0
+            self._register_dispatch_collect_info(
+                "translator", dp_rank=self.ulysses_device_mesh["dp"].get_local_rank(), is_collect=is_collect
+            )
+        else:
+            self._register_dispatch_collect_info("translator", dp_rank=self.rank, is_collect=True)
+
+        self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
+
+        # set FSDP offload params
+        self._is_offload_param = self.config.model.fsdp_config.param_offload
+        self._is_offload_optimizer = self.config.model.fsdp_config.optimizer_offload
+
+        # normalize config
+        self.config.ppo_mini_batch_size *= self.config.rollout_n
+        self.config.ppo_mini_batch_size //= torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size
+        if self.config.ppo_micro_batch_size is not None:
+            self.config.ppo_micro_batch_size //= (
+                torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size
+            )
+            self.config.forward_micro_batch_size //= (
+                torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size
+            )
+            self.config.ppo_micro_batch_size_per_gpu = self.config.ppo_micro_batch_size
+            self.config.forward_micro_batch_size_per_gpu = self.config.forward_micro_batch_size
+
+        if self.config.ppo_micro_batch_size_per_gpu is not None:
+            assert self.config.ppo_mini_batch_size % self.config.ppo_micro_batch_size_per_gpu == 0, (
+                f"normalized ppo_mini_batch_size {self.config.ppo_mini_batch_size} should be divisible by "
+                f"ppo_micro_batch_size_per_gpu {self.config.ppo_micro_batch_size_per_gpu}"
+            )
+            assert self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu > 0, (
+                f"normalized ppo_mini_batch_size {self.config.ppo_mini_batch_size} should be larger than "
+                f"ppo_micro_batch_size_per_gpu {self.config.ppo_micro_batch_size_per_gpu}"
+            )
+        self._is_lora = self.config.model.get("lora_rank", 0) > 0
+
+    def _build_translator_model_optimizer(self, config):
+        # the following line is necessary
+        from torch import optim
+        from torch.distributed.fsdp import MixedPrecision
+
+        from verl.utils.model import print_model_size
+        from verl.utils.torch_dtypes import PrecisionType
+
+        use_shm = config.model.get("use_shm", False)
+        local_path = copy_to_local(config.model.path, use_shm=use_shm)
+
+        tokenizer_path = copy_to_local(config.model.tokenizer_path, use_shm=use_shm)
+        self.tokenizer = hf_tokenizer(tokenizer_path, trust_remote_code=config.model.get("trust_remote_code", False))
+        self.processor = hf_processor(tokenizer_path, trust_remote_code=config.model.get("trust_remote_code", False))
+
+        if self.config.model.get("custom_chat_template", None) is not None:
+            if self.processor is not None:
+                self.processor.chat_template = self.config.model.custom_chat_template
+            else:
+                self.tokenizer.chat_template = self.config.model.custom_chat_template
+
+        override_config = OmegaConf.to_container(OmegaConf.create(self.config.model.get("override_config", {})))
+        override_config_kwargs = {
+            "bos_token_id": self.tokenizer.bos_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "pad_token_id": self.tokenizer.pad_token_id,
+        }
+        override_config_kwargs.update(override_config)
+        if self.rank == 0:
+            print(f"Translator overriding config {override_config_kwargs}")
+
+        torch_dtype = self.config.model.fsdp_config.get("model_dtype", "fp32")
+        torch_dtype = PrecisionType.to_dtype(torch_dtype)
+
+        from transformers import AutoConfig, AutoModelForCausalLM
+
+        translator_model_config = AutoConfig.from_pretrained(
+            local_path,
+            attn_implementation="flash_attention_2",
+            trust_remote_code=config.model.get("trust_remote_code", False),
+        )
+        # patch for kimi-vl
+        if getattr(translator_model_config, "model_type", None) == "kimi_vl":
+            translator_model_config.text_config.topk_method = "greedy"
+
+        init_context = get_init_weight_context_manager(
+            use_meta_tensor=not translator_model_config.tie_word_embeddings, mesh=self.device_mesh
+        )
+
+        with init_context(), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            translator_module = AutoModelForCausalLM.from_pretrained(
+                pretrained_model_name_or_path=local_path,
+                torch_dtype=torch_dtype,
+                config=translator_model_config,
+                trust_remote_code=config.model.get("trust_remote_code", False),
+            )
+
+            use_remove_padding = config.model.get("use_remove_padding", False)
+
+            apply_monkey_patch(
+                model=translator_module,
+                use_remove_padding=use_remove_padding,
+                ulysses_sp_size=self.ulysses_sequence_parallel_size,
+            )
+
+            # some parameters may not in torch_dtype
+            translator_module.to(torch_dtype)
+
+            if config.model.get("enable_gradient_checkpointing", False):
+                translator_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+
+        if self._is_lora:
+            print("Applying LoRA to translator module")
+            translator_module.enable_input_require_grads()
+            # Convert config to regular Python types before creating PEFT model
+            lora_config = {
+                "task_type": TaskType.CAUSAL_LM,
+                "r": self.config.model.lora_rank,
+                "lora_alpha": self.config.model.lora_alpha,
+                "target_modules": convert_to_regular_types(self.config.model.target_modules),
+                "bias": "none",
+            }
+            translator_module = get_peft_model(translator_module, LoraConfig(**lora_config))
+
+        if self.rank == 0:
+            print_model_size(translator_module)
+
+        self.translator_model_config = translator_model_config
+
+        fsdp_config = self.config.model.fsdp_config
+        mixed_precision_config = fsdp_config.get("mixed_precision", None)
+        if mixed_precision_config is not None:
+            param_dtype = PrecisionType.to_dtype(mixed_precision_config.get("param_dtype", "bf16"))
+            reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get("reduce_dtype", "fp32"))
+            buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get("buffer_dtype", "fp32"))
+        else:
+            param_dtype = torch.bfloat16
+            reduce_dtype = torch.float32
+            buffer_dtype = torch.float32
+
+        mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
+
+        auto_wrap_policy = get_fsdp_wrap_policy(
+            module=translator_module,
+            config=self.config.model.fsdp_config.wrap_policy,
+            is_lora=self.config.model.get("lora_rank", 0) > 0,
+        )
+
+        log_gpu_memory_usage("Before translator FSDP", logger=None)
+
+        fsdp_mesh = self.device_mesh
+        sharding_strategy = get_sharding_strategy(fsdp_mesh)
+
+        # Note: We force turn off CPUOffload for translator because it causes incorrect results when using grad accumulation
+        if config.strategy == "fsdp":
+            translator_module = FSDP(
+                translator_module,
+                param_init_fn=init_fn,
+                use_orig_params=False,
+                auto_wrap_policy=auto_wrap_policy,
+                device_id=get_device_id(),
+                sharding_strategy=sharding_strategy,
+                mixed_precision=mixed_precision,
+                sync_module_states=True,
+                forward_prefetch=self.config.model.fsdp_config.forward_prefetch,
+                device_mesh=self.device_mesh,
+                cpu_offload=None,
+            )
+        elif config.strategy == "fsdp2":
+            assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
+            mp_policy = MixedPrecisionPolicy(
+                param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=True
+            )
+            offload_policy = None
+            if fsdp_config.offload_policy:
+                self._is_offload_param = False
+                self._is_offload_optimizer = False
+                offload_policy = CPUOffloadPolicy(pin_memory=True)
+
+            fsdp_kwargs = {
+                "mesh": fsdp_mesh,
+                "mp_policy": mp_policy,
+                "offload_policy": offload_policy,
+                "reshard_after_forward": fsdp_config.reshard_after_forward,
+                "shard_placement_fn": get_shard_placement_fn(fsdp_size=self.device_mesh.shape[-1]),
+            }
+            full_state = translator_module.state_dict()
+            apply_fsdp2(translator_module, fsdp_kwargs, fsdp_config)
+            fsdp2_load_full_state_dict(translator_module, full_state, fsdp_mesh, offload_policy)
+        else:
+            raise NotImplementedError(f"Unknown strategy {config.strategy}")
+
+        if config.model.get("enable_activation_offload", False):
+            enable_gradient_checkpointing = config.model.get("enable_gradient_checkpointing", False)
+            enable_activation_offloading(translator_module, config.strategy, enable_gradient_checkpointing)
+
+        log_gpu_memory_usage("After translator FSDP", logger=None)
+
+        translator_optimizer = optim.AdamW(
+            translator_module.parameters(),
+            lr=config.optim.lr,
+            betas=config.optim.get("betas", (0.9, 0.999)),
+            weight_decay=config.optim.get("weight_decay", 1e-2),
+        )
+
+        total_steps = config.optim.get("total_training_steps", 0)
+        num_warmup_steps = int(config.optim.get("lr_warmup_steps", -1))
+        warmup_style = config.optim.get("warmup_style", "constant")
+        if num_warmup_steps < 0:
+            num_warmup_steps_ratio = config.optim.get("lr_warmup_steps_ratio", 0.0)
+            num_warmup_steps = int(num_warmup_steps_ratio * total_steps)
+
+        if self.rank == 0:
+            print(f"Total steps: {total_steps}, num_warmup_steps: {num_warmup_steps}")
+
+        from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
+
+        if warmup_style == "constant":
+            translator_lr_scheduler = get_constant_schedule_with_warmup(
+                optimizer=translator_optimizer, num_warmup_steps=num_warmup_steps
+            )
+        elif warmup_style == "cosine":
+            min_lr_ratio = config.optim.get("min_lr_ratio", 0.0)
+            num_cycles = config.optim.get("num_cycles", 0.5)
+            translator_lr_scheduler = get_cosine_schedule_with_warmup(
+                optimizer=translator_optimizer,
+                num_warmup_steps=num_warmup_steps,
+                num_training_steps=total_steps,
+                min_lr_ratio=min_lr_ratio,
+                num_cycles=num_cycles,
+            )
+        else:
+            raise NotImplementedError(f"Warmup style {warmup_style} is not supported")
+
+        return translator_module, translator_optimizer, translator_lr_scheduler
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):
+        # This is used to import external_lib into the huggingface systems
+        import_external_libs(self.config.model.get("external_lib", None))
+
+        self.translator_module, self.translator_optimizer, self.translator_lr_scheduler = self._build_translator_model_optimizer(
+            self.config
+        )
+
+        # Initialize the translator with the built model and optimizer
+        from verl.workers.translator import DataParallelPPOTranslator
+        self.translator = DataParallelPPOTranslator(
+            config=self.config, 
+            translator_module=self.translator_module, 
+            translator_optimizer=self.translator_optimizer
+        )
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.translator_module)
+            log_gpu_memory_usage("After offload translator model during init", logger=logger)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.translator_optimizer)
+            log_gpu_memory_usage("After offload translator optimizer during init", logger=logger)
+
+        self.flops_counter = FlopsCounter(self.translator_model_config)
+        self.checkpoint_manager = FSDPCheckpointManager(
+            model=self.translator_module,
+            optimizer=self.translator_optimizer,
+            lr_scheduler=self.translator_lr_scheduler,
+            processing_class=self.processor if self.processor is not None else self.tokenizer,
+            checkpoint_config=self.config.checkpoint,
+        )
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="translator"))
+    @DistProfiler.annotate(color="green")
+    def translate(self, data: DataProto):
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.translator_module)
+        
+        micro_batch_size = self.config.forward_micro_batch_size_per_gpu
+        data.meta_info["micro_batch_size"] = micro_batch_size
+        data.meta_info["max_token_len"] = self.config.forward_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.use_dynamic_bsz
+        
+        # perform translation computation - compute log probabilities of translations
+        with self.ulysses_sharding_manager:
+            data = data.to("cpu")  # data will to device with each micro batch on translator.compute_log_prob
+            log_probs, entropys = self.translator.compute_log_prob(data=data, calculate_entropy=True)
+            output = DataProto.from_dict(
+                tensors={"log_probs": log_probs, "entropys": entropys},
+                meta_info={"temperature": self.config.temperature},
+            )
+
+        output = output.to("cpu")
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.translator_module)
+        return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="translator"))
+    @DistProfiler.annotate(color="orange")
+    def update_translator(self, data: DataProto):
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.translator_module)
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(optimizer=self.translator_optimizer, device_id=get_device_id())
+
+        # perform training computation
+        with self.ulysses_sharding_manager:
+            data = data.to("cpu")  # data will to device with each micro batch on translator.update_translator
+            with Timer(name="update_translator", logger=None) as timer:
+                metrics = self.translator.update_translator(data=data)
+            delta_time = timer.last
+
+            global_num_tokens = data.meta_info.get("global_token_num", 0)
+            if global_num_tokens > 0:
+                estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+                metrics["perf/mfu/translator"] = estimated_flops / promised_flops / self.world_size
+
+            lr = self.translator_lr_scheduler.get_last_lr()[0]
+            metrics["translator/lr"] = lr
+            self.translator_lr_scheduler.step()
+
+            output = DataProto(batch=None, meta_info={"metrics": metrics})
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.translator_module)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.translator_optimizer)
+
+        output = output.to("cpu")
+        return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="translator"))
+    @DistProfiler.annotate(color="purple", role="translator_compute_log_prob")
+    def compute_log_prob(self, data: DataProto):
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.translator_module)
+
+        # Support all hardwares
+        from contextlib import nullcontext
+
+        is_lora = data.meta_info.pop("is_lora", False)
+        adapter_ctx = self.translator.translator_module.disable_adapter() if is_lora else nullcontext()
+        
+        # we should always recompute old_log_probs when it is HybridEngine
+        data.meta_info["micro_batch_size"] = self.config.forward_micro_batch_size_per_gpu
+        data.meta_info["max_token_len"] = self.config.forward_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.use_dynamic_bsz
+        data.meta_info["temperature"] = self.config.temperature
+        
+        # perform recompute log_prob
+        with self.ulysses_sharding_manager:
+            with adapter_ctx:
+                output, entropys = self.translator.compute_log_prob(data=data, calculate_entropy=True)
+            output = DataProto.from_dict(
+                tensors={"old_log_probs": output, "entropys": entropys},
+                meta_info={"temperature": self.config.temperature},
+            )
+
+        output = output.to("cpu")
+
+        # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
+        # unshard the root FSDP module
+        if self.world_size > 1 and fsdp_version(self.translator.translator_module) == 1:
+            self.translator.translator_module._handle.reshard(True)
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.translator_module)
+            log_gpu_memory_usage("After offload translator model during compute_log_prob", logger=logger)
+
+        return output
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
+        import torch
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.translator_module)
+
+        self.checkpoint_manager.save_checkpoint(
+            local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
+        )
+
+        torch.distributed.barrier()
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.translator_module)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=True):
+        import torch
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.translator_module)
+
+        self.checkpoint_manager.load_checkpoint(
+            local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
+        )
+
+        torch.distributed.barrier()
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.translator_module)
+
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(self.translator_optimizer)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def start_profile(self, **kwargs) -> None:
+        """Start profiling for the current rank in the current training step."""
+        self.profiler.start(**kwargs)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def stop_profile(self) -> None:
+        """Stop profiling for the current rank in the current training step."""
+        self.profiler.stop()
 
 # ================================= Async related workers =================================
 class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):

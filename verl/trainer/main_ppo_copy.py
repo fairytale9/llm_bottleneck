@@ -12,11 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Modified version of main_ppo.py that includes our custom TranslatorWorker.
-
-This file extends the original PPO trainer to include a TranslatorWorker for policy updates.
-The TranslatorWorker can compute log probabilities and perform supervised fine-tuning.
-
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
 """
 
@@ -29,16 +24,10 @@ from omegaconf import OmegaConf
 
 from verl.experimental.dataset.sampler import AbstractSampler
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer, Role as BaseRole
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.reward import load_reward_manager
 from verl.utils.device import is_cuda_available
 from verl.utils.import_utils import load_extern_type
-
-# Extend the Role enum to include our new Translator role
-from enum import Enum
-class Role(BaseRole):
-    """Extended Role enum with our custom Translator role."""
-    Translator = 7  # Add our new role
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
@@ -143,6 +132,8 @@ class TaskRunner:
         else:
             raise NotImplementedError
 
+        from verl.trainer.ppo.ray_trainer import Role
+
         self.role_worker_mapping[Role.ActorRollout] = ray.remote(actor_rollout_cls)
 
         return actor_rollout_cls, ray_worker_group_cls
@@ -166,17 +157,20 @@ class TaskRunner:
         else:
             raise NotImplementedError
 
+        from verl.trainer.ppo.ray_trainer import Role
+
         self.role_worker_mapping[Role.Critic] = ray.remote(CriticWorker)
 
     def init_resource_pool_mgr(self, config):
         """Initialize resource pool manager."""
+        from verl.trainer.ppo.ray_trainer import Role
+
         global_pool_id = "global_pool"
         resource_pool_spec = {
             global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
         }
         self.mapping[Role.ActorRollout] = global_pool_id
         self.mapping[Role.Critic] = global_pool_id
-        self.mapping[Role.Translator] = global_pool_id
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
@@ -184,6 +178,8 @@ class TaskRunner:
 
     def add_reward_model_worker(self, config):
         """Add reward model worker if enabled."""
+        from verl.trainer.ppo.ray_trainer import Role
+
         if config.reward_model.enable:
             if config.reward_model.strategy in {"fsdp", "fsdp2"}:
                 from verl.workers.fsdp_workers import RewardModelWorker
@@ -196,17 +192,11 @@ class TaskRunner:
 
     def add_ref_policy_worker(self, config, ref_policy_cls):
         """Add reference policy worker if KL loss or KL reward is used."""
+        from verl.trainer.ppo.ray_trainer import Role
+
         if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
             self.role_worker_mapping[Role.RefPolicy] = ray.remote(ref_policy_cls)
             self.mapping[Role.RefPolicy] = "global_pool"
-
-    def add_translator_worker(self, config):
-        """Add translator worker the little m."""
-        from verl.workers.translator_worker import TranslatorWorker
-        
-        # Add the translator worker to the role mapping
-        self.role_worker_mapping[Role.Translator] = ray.remote(TranslatorWorker)
-        self.mapping[Role.Translator] = "global_pool"
 
     def run(self, config):
         """Execute the main PPO training workflow.
@@ -257,11 +247,7 @@ class TaskRunner:
         # Add a reference policy worker if KL loss or KL reward is used.
         self.add_ref_policy_worker(config, actor_rollout_cls)
 
-        # Add our custom translator worker for policy updates
-        self.add_translator_worker(config)
-        
         # Load the reward manager for training and validation.
-        # The custom reward manager will be automatically loaded by load_reward_manager
         reward_fn = load_reward_manager(
             config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
         )
@@ -278,10 +264,8 @@ class TaskRunner:
         val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor, is_train=False)
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
-        # Initialize the LLM Bottleneck trainer (extends RayPPOTrainer with TranslatorWorker support).
-        from recipe.llm_bottleneck import RayLLMBottleneckTrainer
-        
-        trainer = RayLLMBottleneckTrainer(
+        # Initialize the PPO trainer.
+        trainer = RayPPOTrainer(
             config=config,
             tokenizer=tokenizer,
             processor=processor,

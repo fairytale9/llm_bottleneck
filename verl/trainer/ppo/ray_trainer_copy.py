@@ -77,7 +77,6 @@ class Role(Enum):
     RefPolicy = 4
     RewardModel = 5
     ActorRolloutRef = 6
-    Translator = 7
 
 
 @dataclass
@@ -355,7 +354,6 @@ class RayPPOTrainer:
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = Role.RefPolicy in role_worker_mapping
         self.use_rm = Role.RewardModel in role_worker_mapping
-        self.use_translator = Role.Translator in role_worker_mapping
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name if device_name else self.config.trainer.device
         self.validation_generations_logger = ValidationGenerationsLogger(
@@ -487,11 +485,6 @@ class RayPPOTrainer:
         if self.use_critic:
             critic_config = omega_conf_to_dataclass(config.critic)
             critic_config.validate(n_gpus, config.data.train_batch_size)
-
-        # translator (uses critic configuration)
-        if self.use_translator:
-            translator_config = omega_conf_to_dataclass(config.translator)
-            translator_config.validate(n_gpus, config.data.train_batch_size)
 
         if config.data.get("val_batch_size", None) is not None:
             print(
@@ -834,15 +827,6 @@ class RayPPOTrainer:
             rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
             self.resource_pool_to_cls[resource_pool]["rm"] = rm_cls
 
-        # create translator worker if enabled
-        if self.use_translator:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.Translator)
-            translator_cls = RayClassWithInitArgs(
-                self.role_worker_mapping[Role.Translator], 
-                config=self.config.get('translator', {})
-            )
-            self.resource_pool_to_cls[resource_pool]["translator"] = translator_cls
-
         # initialize WorkerGroup
         # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
         # you should not use `create_colocated_worker_cls`.
@@ -884,10 +868,6 @@ class RayPPOTrainer:
         if self.use_rm:
             self.rm_wg = all_wg["rm"]
             self.rm_wg.init_model()
-
-        if self.use_translator:
-            self.translator_wg = all_wg["translator"]
-            self.translator_wg.init_model()
 
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         self.actor_rollout_wg = all_wg["actor_rollout"]
@@ -1029,8 +1009,6 @@ class RayPPOTrainer:
                 self.critic_wg.start_profile()
             if self.use_rm:
                 self.rm_wg.start_profile()
-            if self.use_translator:
-                self.translator_wg.start_profile()
 
     def _stop_profiling(self, do_profile: bool) -> None:
         """Stop profiling for all worker groups if profiling is enabled."""
@@ -1042,8 +1020,6 @@ class RayPPOTrainer:
                 self.critic_wg.stop_profile()
             if self.use_rm:
                 self.rm_wg.stop_profile()
-            if self.use_translator:
-                self.translator_wg.stop_profile()
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen"):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
@@ -1079,6 +1055,7 @@ class RayPPOTrainer:
             default_backend=self.config.trainer.logger,
             config=OmegaConf.to_container(self.config, resolve=True),
         )
+
         self.global_steps = 0
 
         # load checkpoint before doing anything
@@ -1283,18 +1260,6 @@ class RayPPOTrainer:
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
-
-                    # TODO: Add translator worker method calls here
-                    # Example placeholders for translator worker methods:
-                    # if self.use_translator:
-                    #     with marked_timer("translator_compute_log_prob", timing_raw, color="green"):
-                    #         translator_log_prob = self.translator_wg.compute_log_prob(batch)
-                    #         # Process translator log probabilities
-                    #     
-                    #     with marked_timer("translator_update", timing_raw, color="orange"):
-                    #         translator_output = self.translator_wg.update_translator(batch)
-                    #         translator_metrics = reduce_metrics(translator_output.meta_info["metrics"])
-                    #         metrics.update(translator_metrics)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
