@@ -2047,10 +2047,9 @@ class TranslatorWorker(Worker, DistProfilerExtension):
                 metrics = self.translator.update_translator(data=data)
             delta_time = timer.last
 
-            global_num_tokens = data.meta_info.get("global_token_num", 0)
-            if global_num_tokens > 0:
-                estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
-                metrics["perf/mfu/translator"] = estimated_flops / promised_flops / self.world_size
+            global_num_tokens = data.meta_info["global_token_num"]
+            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+            metrics["perf/mfu/translator"] = estimated_flops / promised_flops / self.world_size
 
             lr = self.translator_lr_scheduler.get_last_lr()[0]
             metrics["translator/lr"] = lr
@@ -2082,15 +2081,14 @@ class TranslatorWorker(Worker, DistProfilerExtension):
         data.meta_info["micro_batch_size"] = self.config.forward_micro_batch_size_per_gpu
         data.meta_info["max_token_len"] = self.config.forward_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.use_dynamic_bsz
-        data.meta_info["temperature"] = self.config.temperature
+        data.meta_info["temperature"] = 1.0
         
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             with adapter_ctx:
-                output, entropys = self.translator.compute_log_prob(data=data, calculate_entropy=True)
+                output, entropys = self.translator.compute_log_prob(data=data, calculate_entropy=False)
             output = DataProto.from_dict(
-                tensors={"old_log_probs": output, "entropys": entropys},
-                meta_info={"temperature": self.config.temperature},
+                tensors={"m_log_probs": output},
             )
 
         output = output.to("cpu")

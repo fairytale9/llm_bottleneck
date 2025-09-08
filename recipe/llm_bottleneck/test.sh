@@ -4,11 +4,17 @@ set -x
 
 gsm8k_train_path=$HOME/data/gsm8k/train.parquet
 gsm8k_test_path=$HOME/data/gsm8k/test.parquet
-math_train_path=$HOME/data/math/train.parquet
-math_test_path=$HOME/data/math/test.parquet
+#math_train_path=$HOME/data/math/train.parquet
+#math_test_path=$HOME/data/math/test.parquet
 
-train_files="['$gsm8k_train_path', '$math_train_path']"
-test_files="['$gsm8k_test_path', '$math_test_path']"
+#translator.ppo_mini_batch_size=256 \
+#translator.ppo_micro_batch_size_per_gpu=32 \
+
+#train_files="['$gsm8k_train_path', '$math_train_path']"
+#test_files="['$gsm8k_test_path', '$math_test_path']"
+
+train_files="['$gsm8k_train_path']"
+test_files="['$gsm8k_test_path']"
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -41,6 +47,7 @@ python3 -m verl.trainer.main_ppo \
     reward_model.reward_manager='naive' \
     translator.enable=true \
     translator.model.path=/projectnb/noc-lab/ylchen/model/qwen_0.6b \
+    translator.ppo_epochs=1 \
     translator.optim.lr=1e-5 \
     translator.model.use_remove_padding=False \
     translator.model.enable_gradient_checkpointing=False \

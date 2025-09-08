@@ -103,6 +103,7 @@ class RLHFDataset(Dataset):
         self.image_key = config.get("image_key", "images")
         self.video_key = config.get("video_key", "videos")
         self.max_prompt_length = config.get("max_prompt_length", 1024)
+        self.max_response_length = config.get("max_response_length", 1024)
         self.return_raw_chat = config.get("return_raw_chat", False)
         self.return_full_prompt = config.get("return_full_prompt", False)
         self.truncation = config.get("truncation", "error")
@@ -272,6 +273,16 @@ class RLHFDataset(Dataset):
             input_ids = model_inputs.pop("input_ids")
             attention_mask = model_inputs.pop("attention_mask")
 
+            # process response
+            response = row_dict['extra_info']['answer'] # raw response
+            if response:
+                model_inputs_for_response = self.tokenizer(response, return_tensors="pt", add_special_tokens=False)
+                input_ids_for_response = model_inputs_for_response.pop("input_ids")
+                attention_mask_for_response = model_inputs_for_response.pop("attention_mask")
+            else:
+                input_ids_for_response = torch.tensor([[self.tokenizer.eos_token_id]])
+                attention_mask_for_response = torch.tensor([[0]])
+
         input_ids, attention_mask = verl_F.postprocess_data(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -279,6 +290,15 @@ class RLHFDataset(Dataset):
             pad_token_id=self.tokenizer.pad_token_id,
             left_pad=True,
             truncation=self.truncation,
+        )
+
+        input_ids_for_response, attention_mask_for_response = verl_F.postprocess_data(
+            input_ids=input_ids_for_response,
+            attention_mask=attention_mask_for_response,
+            max_length=self.max_response_length,
+            pad_token_id=self.tokenizer.pad_token_id,
+            left_pad=False,
+            truncation="right",
         )
 
         if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
@@ -301,6 +321,8 @@ class RLHFDataset(Dataset):
         row_dict["input_ids"] = input_ids[0]
         row_dict["attention_mask"] = attention_mask[0]
         row_dict["position_ids"] = position_ids[0]
+        row_dict['target_ids'] = input_ids_for_response[0]
+        row_dict['target_attention_mask'] = attention_mask_for_response[0]
 
         raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
         if len(raw_prompt_ids) > self.max_prompt_length:

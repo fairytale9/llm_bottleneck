@@ -54,82 +54,6 @@ class DataParallelPPOTranslator(BasePPOTranslator):
         self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
         self.device_name = get_device_name()
 
-    def _forward_micro_batch(self, micro_batch):
-        response_length = micro_batch["responses"].size(-1)
-        multi_modal_inputs = {}
-        if "multi_modal_inputs" in micro_batch.keys():
-            for key in micro_batch["multi_modal_inputs"][0].keys():
-                multi_modal_inputs[key] = torch.cat(
-                    [inputs[key] for inputs in micro_batch["multi_modal_inputs"]], dim=0
-                )
-
-        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
-            input_ids = micro_batch["input_ids"]
-            batch, seqlen = input_ids.shape
-            attention_mask = micro_batch["attention_mask"]
-            position_ids = micro_batch["position_ids"]
-            if position_ids.dim() == 3:  # qwen2vl mrope
-                position_ids = position_ids.transpose(0, 1)
-
-            if self.use_remove_padding:
-                input_ids_rmpad, indices, *_ = unpad_input(
-                    input_ids.unsqueeze(-1), attention_mask
-                )  # input_ids_rmpad (total_nnz, ...)
-                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
-
-                # unpad the position_ids to align the rotary
-                if position_ids.dim() == 3:
-                    position_ids_rmpad = (
-                        index_first_axis(rearrange(position_ids, "c b s ... -> (b s) c ..."), indices)
-                        .transpose(0, 1)
-                        .unsqueeze(1)
-                    )  # (3, bsz, seqlen) -> (3, 1, bsz * seqlen)
-                else:
-                    position_ids_rmpad = index_first_axis(
-                        rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
-                    ).transpose(0, 1)
-
-                # pad and slice the inputs if sp > 1
-                if self.ulysses_sequence_parallel_size > 1:
-                    input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(
-                        input_ids_rmpad, position_ids_rmpad, sp_size=self.ulysses_sequence_parallel_size
-                    )
-
-                # only pass input_ids and position_ids to enable flash_attn_varlen
-                output = self.translator_module(
-                    input_ids=input_ids_rmpad,
-                    attention_mask=None,
-                    position_ids=position_ids_rmpad,
-                    **multi_modal_inputs,
-                    use_cache=False,
-                )  # prevent model thinks we are generating
-
-                # Extract logits for translation
-                logits_rmpad = output.logits
-                logits_rmpad = logits_rmpad.squeeze(0)  # (total_nnz, vocab_size)
-
-                # gather output if sp > 1
-                if self.ulysses_sequence_parallel_size > 1:
-                    logits_rmpad = gather_outputs_and_unpad(
-                        logits_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size
-                    )
-
-                # pad it back
-                logits = pad_input(logits_rmpad, indices=indices, batch=batch, seqlen=seqlen)
-                logits = logits[:, -response_length - 1 : -1]
-            else:
-                output = self.translator_module(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    **multi_modal_inputs,
-                    use_cache=False,
-                )  # prevent model thinks we are generating
-                
-                logits = output.logits
-                logits = logits[:, -response_length - 1 : -1]
-            return logits
-
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
 
@@ -147,17 +71,153 @@ class DataParallelPPOTranslator(BasePPOTranslator):
         else:
             self.translator_optimizer.step()
         return grad_norm
+    
+    def _process_micro_batch(self, micro_batch, temperature, is_train=False, calculate_entropy=False):
+        prompt_length = micro_batch["prompts"].size(-1)
+        response_attention_mask = micro_batch["attention_mask"][:, prompt_length:]
+        responses = micro_batch["responses"]
+        targets = micro_batch["target_ids"]
+        target_length = targets.size(-1)
+        targets_attention_mask = micro_batch["target_attention_mask"]
+        
+        input_ids = torch.cat((responses, targets), dim=1)
+        attention_mask = torch.cat((response_attention_mask, targets_attention_mask), dim=1)
+
+        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+            entropy = None
+
+            output = self.translator_module(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+            )  # prevent model thinks we are generating
+
+            logits = output.logits
+            logits.div_(temperature)
+            
+            # Extract logits for target tokens (at the end of the sequence)
+            target_logits = logits[:, -target_length-1:-1, :]  # (bsz, target_length, vocab_size)
+            if is_train:
+                return target_logits, targets, targets_attention_mask
+            
+            # compute log probabilities for the target tokens
+            log_probs = logprobs_from_logits(target_logits, targets)
+            
+            if calculate_entropy:
+                entropy = torch.distributions.Categorical(logits=target_logits).entropy()  # (bsz, target_length)
+
+        return entropy, log_probs
+
+    @GPUMemoryLogger(role="dp translator", logger=logger)
+    def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> tuple[torch.Tensor, torch.Tensor]:
+        self.translator_module.eval()
+
+        micro_batch_size = data.meta_info["micro_batch_size"]
+        temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
+
+        select_keys = ["prompts", "responses", "target_ids", "target_attention_mask", "attention_mask"]
+        non_tensor_select_keys = []
+        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
+
+        micro_batches = data.split(micro_batch_size)
+
+        log_probs_lst = []
+        entropy_lst = []
+        for micro_batch in micro_batches:
+            micro_batch = micro_batch.to(get_device_id())
+            model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            with torch.no_grad():
+                entropy, log_probs = self._process_micro_batch(
+                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                )
+            log_probs_lst.append(log_probs)
+            if calculate_entropy:
+                entropy_lst.append(entropy)
+
+        log_probs = torch.concat(log_probs_lst, dim=0)
+        entropys = None
+        if calculate_entropy:
+            entropys = torch.concat(entropy_lst, dim=0)
+
+        return log_probs, entropys
+
+    @GPUMemoryLogger(role="dp translator", logger=logger)
+    def update_translator(self, data: DataProto):
+        # make sure we are in training mode
+        self.translator_module.train()
+        metrics = {}
+
+        select_keys = ["prompts", "responses", "target_ids", "target_attention_mask", "attention_mask"]
+        non_tensor_select_keys = []
+        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
+
+        # Split to make minibatch iterator for updating the translator
+        mini_batches = data.split(self.config.ppo_mini_batch_size)
+
+        for _ in range(self.config.ppo_epochs):
+            for batch_idx, mini_batch in enumerate(mini_batches):
+                self.gradient_accumulation = (
+                    self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+                )
+                micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+
+                self.translator_optimizer.zero_grad()
+
+                for micro_batch in micro_batches:
+                    micro_batch = micro_batch.to(get_device_id())
+                    micro_batch_metrics = {}
+                    model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+
+                    logits, targets, loss_mask = self._process_micro_batch(model_inputs, temperature=1.0, is_train=True)
+                    
+                    logits = logits.contiguous()
+                    targets = targets.contiguous()
+                    loss_mask = loss_mask.contiguous().view(-1)
+
+                    # calculate cross-entropy loss
+                    loss_fn = torch.nn.CrossEntropyLoss(reduction='none')
+                    loss = loss_fn(
+                        logits.view(-1, logits.size(-1)), 
+                        targets.view(-1)
+                    )
+                    loss = loss * loss_mask
+                    loss = torch.sum(loss) / torch.sum(loss_mask)
+                    loss_scale_factor = 1 / self.gradient_accumulation
+                    loss = loss * loss_scale_factor
+                    
+                    loss.backward()
+
+                    micro_batch_metrics.update(
+                        {
+                            "translator/loss": loss.detach().item(),
+                            #"translator/logits_mean": masked_mean(logits, response_mask).detach().item(),
+                        }
+                    )
+
+                    append_to_dict(metrics, micro_batch_metrics)
+
+                grad_norm = self._optimizer_step()
+                mini_batch_metrics = {"translator/grad_norm": grad_norm.detach().item()}
+                append_to_dict(metrics, mini_batch_metrics)
+        self.translator_optimizer.zero_grad()
+        return metrics
 
     def _forward_micro_batch_for_log_prob(self, micro_batch, temperature, calculate_entropy=False):
         """
-        Forward pass for computing log probabilities of translations.
-        Similar to actor's _forward_micro_batch but adapted for translation tasks.
+        Forward pass for computing log probabilities of targets given responses.
+        Similar to actor's _forward_micro_batch.
         
+        Args:
+            micro_batch: Dictionary containing input_ids, attention_mask, position_ids, responses, and target
+            temperature: Temperature for scaling logits
+            calculate_entropy: Whether to calculate entropy
+            
         Returns:
-            entropy: # (bs, response_len) or None
-            log_probs: # (bs, response_len)
+            entropy: # (bs, target_len) or None
+            log_probs: # (bs, target_len) - log probabilities of target tokens given responses
         """
         response_length = micro_batch["responses"].size(-1)
+        target_length = micro_batch["target"].size(-1)
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch.keys():
             for key in micro_batch["multi_modal_inputs"][0].keys():
@@ -193,21 +253,25 @@ class DataParallelPPOTranslator(BasePPOTranslator):
                         rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
                     ).transpose(0, 1)
 
-                # for compute the log_prob - roll input_ids to get targets
-                input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
+                # for compute the log_prob - use target tokens instead of rolled input_ids
+                # We need to extract target tokens from the full sequence
+                # target tokens should be at the end of the sequence after responses
+                total_nnz = input_ids_rmpad.size(1)
+                target_start_idx = total_nnz - target_length * batch_size
+                target_rmpad = input_ids_rmpad[:, target_start_idx:]  # (1, target_length * batch_size)
 
                 # pad and slice the inputs if sp > 1
                 if self.ulysses_sequence_parallel_size > 1:
                     input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(
                         input_ids_rmpad, position_ids_rmpad, sp_size=self.ulysses_sequence_parallel_size
                     )
-                    input_ids_rmpad_rolled, _, _ = ulysses_pad_and_slice_inputs(
-                        input_ids_rmpad_rolled,
+                    target_rmpad, _, _ = ulysses_pad_and_slice_inputs(
+                        target_rmpad,
                         position_ids_rmpad=None,
                         sp_size=self.ulysses_sequence_parallel_size,
                     )
 
-                input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
+                target_rmpad = target_rmpad.squeeze(0)  # ((target_length * batch_size / sp) + pad)
 
                 # only pass input_ids and position_ids to enable flash_attn_varlen
                 output = self.translator_module(
@@ -221,19 +285,22 @@ class DataParallelPPOTranslator(BasePPOTranslator):
                 logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
                 logits_rmpad.div_(temperature)
 
-                # compute log probabilities
+                # Extract logits for target tokens (at the end of the sequence)
+                target_logits_rmpad = logits_rmpad[-target_rmpad.size(0):]  # (target_length * batch_size / sp, vocab_size)
+
+                # compute log probabilities for target tokens
                 inplace_backward = True
                 if calculate_entropy:
                     inplace_backward = False
                 log_probs = logprobs_from_logits(
-                    logits=logits_rmpad,
-                    labels=input_ids_rmpad_rolled,
+                    logits=target_logits_rmpad,
+                    labels=target_rmpad,
                     inplace_backward=inplace_backward,
                 )
 
                 # compute entropy if requested
                 if calculate_entropy:
-                    entropy_rmpad = torch.distributions.Categorical(logits=logits_rmpad).entropy()
+                    entropy_rmpad = torch.distributions.Categorical(logits=target_logits_rmpad).entropy()
 
                 # gather log_prob if sp > 1
                 if self.ulysses_sequence_parallel_size > 1:
@@ -252,25 +319,20 @@ class DataParallelPPOTranslator(BasePPOTranslator):
                             padding_size=pad_size,
                         )
 
-                # pad back to (bsz, seqlen)
+                # pad back to (bsz, target_length)
                 if calculate_entropy:
-                    full_entropy = pad_input(
+                    entropy = pad_input(
                         hidden_states=entropy_rmpad.unsqueeze(-1),
                         indices=indices,
                         batch=batch_size,
-                        seqlen=seqlen,
-                    )
-                full_log_probs = pad_input(
+                        seqlen=target_length,
+                    ).squeeze(-1)  # (bsz, target_length)
+                log_probs = pad_input(
                     hidden_states=log_probs.unsqueeze(-1),
                     indices=indices,
                     batch=batch_size,
-                    seqlen=seqlen,
-                )
-
-                # only return response part:
-                if calculate_entropy:
-                    entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
-                log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
+                    seqlen=target_length,
+                ).squeeze(-1)  # (bsz, target_length)
 
             else:  # not using rmpad and no ulysses sp
                 output = self.translator_module(
@@ -283,143 +345,13 @@ class DataParallelPPOTranslator(BasePPOTranslator):
 
                 logits = output.logits
                 logits.div_(temperature)
-                logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+                # Extract logits for target tokens (at the end of the sequence)
+                target_logits = logits[:, -target_length:, :]  # (bsz, target_length, vocab_size)
                 
-                # compute log probabilities for the response tokens
-                log_probs = logprobs_from_logits(logits, micro_batch["responses"])
+                # compute log probabilities for the target tokens
+                log_probs = logprobs_from_logits(target_logits, micro_batch["target"])
                 
                 if calculate_entropy:
-                    entropy = torch.distributions.Categorical(logits=logits).entropy()  # (bsz, response_length)
+                    entropy = torch.distributions.Categorical(logits=target_logits).entropy()  # (bsz, target_length)
 
             return entropy, log_probs
-
-    @GPUMemoryLogger(role="dp translator", logger=logger)
-    def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute the log probability of the translations given input_ids, attention_mask and position_ids
-
-        Args:
-            data (DataProto): a DataProto containing keys
-
-                ``input_ids``: tensor of shape [batch_size, sequence_length]. torch.int64. Note that input_ids is the
-                concatenation of prompt and response. Note that ``sequence_length = prompt_length + response_length``.
-
-                ``attention_mask``: tensor of shape [batch_size, sequence_length]. torch.int64.
-
-                ``position_ids``: tensor of shape [batch_size, sequence_length]. torch.int64.
-
-                ``responses``:  tensor of shape [batch_size, response_length]. torch.int64.
-
-        Returns:
-            tuple[torch.Tensor, torch.Tensor]: (log_probs, entropy) where entropy can be None if calculate_entropy=False
-        """
-        # set to eval
-        self.translator_module.eval()
-
-        micro_batch_size = data.meta_info["micro_batch_size"]
-        temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
-        use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
-        has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
-        select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
-        non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
-
-        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
-
-        if use_dynamic_bsz:
-            max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
-            micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
-        else:
-            micro_batches = data.split(micro_batch_size)
-
-        log_probs_lst = []
-        entropy_lst = []
-        for micro_batch in micro_batches:
-            micro_batch = micro_batch.to(get_device_id())
-            model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-            with torch.no_grad():
-                entropy, log_probs = self._forward_micro_batch_for_log_prob(
-                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
-                )
-            log_probs_lst.append(log_probs)
-            if calculate_entropy:
-                entropy_lst.append(entropy)
-
-        log_probs = torch.concat(log_probs_lst, dim=0)
-        entropys = None
-        if calculate_entropy:
-            entropys = torch.concat(entropy_lst, dim=0)
-
-        if use_dynamic_bsz:
-            log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
-            if calculate_entropy:
-                entropys = restore_dynamic_batch(entropys, batch_idx_list)
-
-        return log_probs, entropys
-
-    @GPUMemoryLogger(role="dp translator", logger=logger)
-    def update_translator(self, data: DataProto):
-        # make sure we are in training mode
-        self.translator_module.train()
-        metrics = {}
-
-        select_keys = ["input_ids", "responses", "response_mask", "attention_mask", "position_ids", "target"]
-        has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
-        non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
-
-        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
-
-        # Split to make minibatch iterator for updating the translator
-        mini_batches = data.split(self.config.ppo_mini_batch_size)
-
-        for _ in range(self.config.ppo_epochs): # TODO: set epochs
-            for batch_idx, mini_batch in enumerate(mini_batches):
-                if self.config.use_dynamic_bsz:
-                    max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
-                else:
-                    self.gradient_accumulation = (
-                        self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
-                    )
-                    micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
-
-                self.translator_optimizer.zero_grad()
-
-                for micro_batch in micro_batches:
-                    micro_batch = micro_batch.to(get_device_id())
-                    micro_batch_metrics = {}
-                    model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-                    response_mask = model_inputs["response_mask"]
-                    target = model_inputs["target"]
-
-                    logits = self._forward_micro_batch(model_inputs)
-                    
-                    # calculate cross-entropy loss
-                    loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100)
-                    translation_loss = loss_fn(
-                        logits.view(-1, logits.size(-1)), 
-                        target.view(-1)
-                    )
-                    
-                    if self.config.use_dynamic_bsz:
-                        # relative to the dynamic bsz
-                        loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
-                        loss = translation_loss * loss_scale_factor
-                    else:
-                        loss_scale_factor = 1 / self.gradient_accumulation
-                        loss = translation_loss * loss_scale_factor
-
-                    loss.backward()
-
-                    micro_batch_metrics.update(
-                        {
-                            "translator/translation_loss": translation_loss.detach().item() * loss_scale_factor,
-                            "translator/logits_mean": masked_mean(logits, response_mask).detach().item(),
-                        }
-                    )
-
-                    append_to_dict(metrics, micro_batch_metrics)
-
-                grad_norm = self._optimizer_step()
-                mini_batch_metrics = {"translator/grad_norm": grad_norm.detach().item()}
-                append_to_dict(metrics, mini_batch_metrics)
-        self.translator_optimizer.zero_grad()
-        return metrics

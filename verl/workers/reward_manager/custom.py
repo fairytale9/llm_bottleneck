@@ -101,12 +101,13 @@ class CustomRewardManager(AbstractRewardManager):
             num_turns = data_item.non_tensor_batch.get("__num_turns__", None)
             extra_info["num_turns"] = num_turns
 
-            # calculate reward
-            length_penalty = 1.0 / valid_response_length
-            item_logp = data_item.batch["m_logp"]
-            avg_logp = item_logp.mean().item()
-            logp_term = -avg_logp * self.logp_weight
-            reward = self.length_weight * length_penalty + logp_term
+            # calculate custom reward
+            valid_target_length = data_item.batch['target_attention_mask'].sum()
+            length_penalty = 1.0 / valid_target_length
+            item_logp = data_item.batch["m_log_probs"]
+            
+            avg_logp = item_logp[:valid_target_length].mean().item()
+            reward = self.length_weight * length_penalty - self.logp_weight * avg_logp 
             reward_tensor[i, valid_response_length - 1] = reward
 
             if data_source not in already_print_data_sources:

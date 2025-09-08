@@ -1127,7 +1127,6 @@ class RayPPOTrainer:
                     )
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
-
                 # add uid to batch
                 batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
@@ -1188,6 +1187,18 @@ class RayPPOTrainer:
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+
+                    # Translator worker method calls here
+                    # Calculate logp of targets; Update itself
+                    if self.use_translator:
+                        with marked_timer("translator_update", timing_raw, color="orange"):
+                            translator_output = self.translator_wg.update_translator(batch)
+                            #translator_metrics = reduce_metrics(translator_output.meta_info["metrics"])
+                            #metrics.update(translator_metrics)
+
+                        with marked_timer("translator_compute_log_prob", timing_raw, color="green"):
+                            m_batch = self.translator_wg.compute_log_prob(batch)
+                            batch = batch.union(m_batch)
 
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
@@ -1284,17 +1295,6 @@ class RayPPOTrainer:
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
-                    # TODO: Add translator worker method calls here
-                    # Example placeholders for translator worker methods:
-                    # if self.use_translator:
-                    #     with marked_timer("translator_compute_log_prob", timing_raw, color="green"):
-                    #         translator_log_prob = self.translator_wg.compute_log_prob(batch)
-                    #         # Process translator log probabilities
-                    #     
-                    #     with marked_timer("translator_update", timing_raw, color="orange"):
-                    #         translator_output = self.translator_wg.update_translator(batch)
-                    #         translator_metrics = reduce_metrics(translator_output.meta_info["metrics"])
-                    #         metrics.update(translator_metrics)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
