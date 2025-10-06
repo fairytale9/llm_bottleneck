@@ -196,8 +196,7 @@ class TaskRunner:
     def add_translator_worker(self, config):
         """Add translator worker for policy updates."""
         from verl.workers.fsdp_workers import TranslatorWorker
-        
-        # Add the translator worker to the role mapping
+        # Use TranslatorWorker which mirrors actor-rollout initialization
         self.role_worker_mapping[Role.Translator] = ray.remote(TranslatorWorker)
         self.mapping[Role.Translator] = "global_pool"
 
@@ -228,11 +227,16 @@ class TaskRunner:
             config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
         )
 
+        m_local_path = copy_to_local(
+            config.translator.model.path, use_shm=config.translator.model.get("use_shm", False)
+        )
+
         # Instantiate the tokenizer and processor.
         from verl.utils import hf_processor, hf_tokenizer
 
         trust_remote_code = config.data.get("trust_remote_code", False)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        m_tokenizer = hf_tokenizer(m_local_path, trust_remote_code=trust_remote_code)
         # Used for multimodal LLM, could be None
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
@@ -267,8 +271,8 @@ class TaskRunner:
         from verl.utils.dataset.rl_dataset import collate_fn
 
         # Create training and validation datasets.
-        train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor, is_train=True)
-        val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor, is_train=False)
+        train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, m_tokenizer, processor, is_train=True)
+        val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, m_tokenizer, processor, is_train=False)
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
         # Initialize the LLM Bottleneck trainer (extends RayPPOTrainer with TranslatorWorker support).
@@ -294,7 +298,7 @@ class TaskRunner:
         trainer.fit()
 
 
-def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True):
+def create_rl_dataset(data_paths, data_config, tokenizer, m_tokenizer, processor, is_train=True):
     """Create a dataset.
 
     Arguments:
@@ -337,6 +341,7 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
     dataset = dataset_cls(
         data_files=data_paths,
         tokenizer=tokenizer,
+        answer_tokenizer=m_tokenizer,
         processor=processor,
         config=data_config,
     )

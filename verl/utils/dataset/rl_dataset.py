@@ -86,6 +86,7 @@ class RLHFDataset(Dataset):
         self,
         data_files: str | list[str],
         tokenizer: PreTrainedTokenizer,
+        answer_tokenizer: PreTrainedTokenizer,
         config: DictConfig,
         processor: Optional[ProcessorMixin] = None,
     ):
@@ -95,6 +96,7 @@ class RLHFDataset(Dataset):
         self.data_files = copy.deepcopy(data_files)
         self.original_data_files = copy.deepcopy(data_files)  # use for resume
         self.tokenizer = tokenizer
+        self.m_tokenizer = answer_tokenizer
         self.processor = processor
         self.config = config
 
@@ -276,11 +278,11 @@ class RLHFDataset(Dataset):
             # process response
             response = row_dict['extra_info']['answer'] # raw response
             if response:
-                model_inputs_for_response = self.tokenizer(response, return_tensors="pt", add_special_tokens=False)
+                model_inputs_for_response = self.m_tokenizer(response, return_tensors="pt")
                 input_ids_for_response = model_inputs_for_response.pop("input_ids")
                 attention_mask_for_response = model_inputs_for_response.pop("attention_mask")
             else:
-                input_ids_for_response = torch.tensor([[self.tokenizer.eos_token_id]])
+                input_ids_for_response = torch.tensor([[self.m_tokenizer.eos_token_id]])
                 attention_mask_for_response = torch.tensor([[0]])
 
         input_ids, attention_mask = verl_F.postprocess_data(
@@ -295,8 +297,8 @@ class RLHFDataset(Dataset):
         input_ids_for_response, attention_mask_for_response = verl_F.postprocess_data(
             input_ids=input_ids_for_response,
             attention_mask=attention_mask_for_response,
-            max_length=self.max_response_length,
-            pad_token_id=self.tokenizer.pad_token_id,
+            max_length=512, # hard coded
+            pad_token_id=self.m_tokenizer.pad_token_id,
             left_pad=False,
             truncation="right",
         )

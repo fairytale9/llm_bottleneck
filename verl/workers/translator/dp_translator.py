@@ -17,6 +17,7 @@ Implement a multiprocess PPOTranslator
 
 import logging
 import os
+import re
 
 import torch
 import torch.distributed
@@ -33,6 +34,9 @@ from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_b
 from verl.utils.torch_functional import masked_mean, logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad_and_slice_inputs
 from verl.workers.translator import BasePPOTranslator
+import verl.utils.torch_functional as verl_F
+
+
 
 if is_cuda_available:
     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
@@ -44,7 +48,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class DataParallelPPOTranslator(BasePPOTranslator):
-    def __init__(self, config, translator_module: nn.Module, translator_optimizer: optim.Optimizer):
+    def __init__(self, config, translator_module: nn.Module, translator_optimizer: optim.Optimizer, translator_tokenizer):
         super().__init__(config=config)
         self.translator_module = translator_module
         self.translator_optimizer = translator_optimizer
@@ -53,6 +57,7 @@ class DataParallelPPOTranslator(BasePPOTranslator):
 
         self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
         self.device_name = get_device_name()
+        self.tokenizer = translator_tokenizer
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -72,7 +77,7 @@ class DataParallelPPOTranslator(BasePPOTranslator):
             self.translator_optimizer.step()
         return grad_norm
     
-    def _process_micro_batch(self, micro_batch, temperature, is_train=False, calculate_entropy=False):
+    def _old_process_micro_batch(self, micro_batch, temperature, is_train=False, calculate_entropy=False):
         prompt_length = micro_batch["prompts"].size(-1)
         response_attention_mask = micro_batch["attention_mask"][:, prompt_length:]
         responses = micro_batch["responses"]
@@ -85,7 +90,62 @@ class DataParallelPPOTranslator(BasePPOTranslator):
 
         with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
             entropy = None
+            print(f"Successfully executed utill this step!")
+            output = self.translator_module(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+            )  # prevent model thinks we are generating
 
+            logits = output.logits
+            logits.div_(temperature)
+            
+            # Extract logits for target tokens (at the end of the sequence)
+            target_logits = logits[:, -target_length-1:-1, :]  # (bsz, target_length, vocab_size)
+            if is_train:
+                return target_logits, targets, targets_attention_mask
+            
+            # compute log probabilities for the target tokens
+            log_probs = logprobs_from_logits(target_logits, targets)
+            
+            if calculate_entropy:
+                entropy = torch.distributions.Categorical(logits=target_logits).entropy()  # (bsz, target_length)
+
+        return entropy, log_probs
+
+    def _process_micro_batch(self, micro_batch, temperature, is_train=False, calculate_entropy=False):
+        reasoning_ids_list = []
+        reasoning_mask_list = []
+        for response_str in micro_batch["raw_responses"]:
+            #match = re.search(r"<think>(.*?)</think>", response_str, re.DOTALL)
+            #if match:
+            #    reasoning = match.group(1)
+            #    print(reasoning)
+             
+            # Tokenize the conditional prompt
+            r_input_ids, r_attention_mask = verl_F.tokenize_and_postprocess_data(
+                prompt=response_str,
+                tokenizer=self.tokenizer,
+                max_length=3072,
+                pad_token_id=self.tokenizer.pad_token_id,
+                left_pad=True,
+                truncation='right'
+            )
+            reasoning_ids_list.append(r_input_ids[0])
+            reasoning_mask_list.append(r_attention_mask[0])
+
+        M_reasoning_ids = torch.stack(reasoning_ids_list, dim=0).to(get_device_id())
+        M_reasoning_mask = torch.stack(reasoning_mask_list, dim=0).to(get_device_id())
+
+        targets = micro_batch["target_ids"]
+        target_length = targets.size(-1)
+        targets_attention_mask = micro_batch["target_attention_mask"]
+
+        input_ids = torch.cat((M_reasoning_ids, targets), dim=1)
+        attention_mask = torch.cat((M_reasoning_mask, targets_attention_mask), dim=1)
+
+        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+            entropy = None
             output = self.translator_module(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -115,8 +175,8 @@ class DataParallelPPOTranslator(BasePPOTranslator):
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
 
-        select_keys = ["prompts", "responses", "target_ids", "target_attention_mask", "attention_mask"]
-        non_tensor_select_keys = []
+        select_keys = ["target_ids", "target_attention_mask"]
+        non_tensor_select_keys = ["raw_responses"]
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
         micro_batches = data.split(micro_batch_size)
@@ -147,8 +207,8 @@ class DataParallelPPOTranslator(BasePPOTranslator):
         self.translator_module.train()
         metrics = {}
 
-        select_keys = ["prompts", "responses", "target_ids", "target_attention_mask", "attention_mask"]
-        non_tensor_select_keys = []
+        select_keys = ["target_ids", "target_attention_mask"] # "prompts", "responses", "attention_mask"
+        non_tensor_select_keys = ["raw_responses"]
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
         # Split to make minibatch iterator for updating the translator
@@ -201,6 +261,19 @@ class DataParallelPPOTranslator(BasePPOTranslator):
                 append_to_dict(metrics, mini_batch_metrics)
         self.translator_optimizer.zero_grad()
         return metrics
+
+
+    @GPUMemoryLogger(role="dp translator", logger=logger)
+    def generate(self, data: DataProto):
+        self.translator_module.eval()
+
+        micro_batch_size = data.meta_info["micro_batch_size"]
+        temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
+
+        select_keys = ["target_ids", "target_attention_mask"]
+        non_tensor_select_keys = ["raw_responses"]
+        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
+
 
     def _forward_micro_batch_for_log_prob(self, micro_batch, temperature, calculate_entropy=False):
         """

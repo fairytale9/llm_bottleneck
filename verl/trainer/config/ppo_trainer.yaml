@@ -29,10 +29,81 @@ defaults:
 
   # Translator model config.
   - critic@translator: dp_critic
+  - rollout@translator.rollout: rollout
 
   # load the reference default config, then apply the fields in the current yaml
   # self config override anything above
   - _self_
+
+translator:
+  _target_: verl.workers.config.FSDPTranslatorConfig
+  
+  rollout:
+
+    # may get higher throughput when set to True. When activated, Please increase max_num_batched_tokens or decrease max_model_len.
+    enable_chunked_prefill: True
+
+    # Which loader to use for rollout model weights: dummy_dtensor, hf, megatron, etc.
+    # safetensors (for huge model, and set use_shm=True); dummy_dtensor: randomly init model weight
+    load_format: dummy_dtensor
+
+    # for huge model, layered summon can save memory (prevent OOM) but make it slower
+    layered_summon: False
+
+    # actor_rollout_ref.rollout.name: hf/vllm/sglang. The default value will be removed in the future
+    name: vllm
+
+    # sync: LLM, async: AsyncLLM
+    mode: sync
+
+    # Sampling temperature for rollout.
+    temperature: 1.0
+
+    # Top-k sampling parameter. -1 for vLLM rollout, 0 for HF rollout.
+    top_k: -1
+
+    # Top-p sampling parameter. Default 1.0.
+    top_p: 1
+
+    # typically the same as data max prompt length
+    # same as data.max_prompt_length if it exists
+    prompt_length: 3072
+
+    # typically the same as data max response length
+    # same as data.max_response_length if it exists
+    response_length: 512
+
+    # for vllm rollout
+    # Rollout model parameters type. Align with actor model's FSDP/Megatron type.
+    dtype: bfloat16
+
+    # Fraction of GPU memory used by vLLM/SGLang for KV cache.
+    gpu_memory_utilization: 0.5
+
+    # Whether to ignore EOS and continue generating after EOS is hit.
+    ignore_eos: False
+
+    # Whether to disable CUDA graph. Default False to best performance.
+    enforce_eager: False
+
+    # batch size of cudagraph to capture. Require enforce_eager: False to use this option
+    # Since cudagraph in inference engine can not be offloaded during update policy,
+    # you can use smaller batch size to save memory used in cuda graph, eg: [1 ,2, 4, 8, 16, 32]
+    # supported engines: vllm
+    cudagraph_capture_sizes: null
+
+    # Whether to free engine KVCache after generation.
+    free_cache_engine: True
+
+    # TP size for rollout. Not effective for hf
+    tensor_model_parallel_size: 1
+
+    # for hf rollout
+    # Whether to sample during training rollout. False uses greedy sampling.
+    do_sample: True
+
+    # number of responses (i.e. num sample times). > 1 for grpo
+    n: 1
 
 # config for actor, rollout and reference model
 actor_rollout_ref:

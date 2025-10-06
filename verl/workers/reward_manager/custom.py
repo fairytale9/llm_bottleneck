@@ -54,15 +54,12 @@ class CustomRewardManager(AbstractRewardManager):
             reward_fn_key: The key used to access the data source in the non-tensor batch data. Defaults to
                 "data_source".
         """
-        super().__init__(**kwargs)
-        
-        self.length_weight = length_weight
-        self.logp_weight = logp_weight
-        self.min_length = min_length
-        self.max_length = max_length
-        self.normalize_logp = normalize_logp
+        self.tokenizer = tokenizer  # Store the tokenizer for decoding token IDs
+        self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
+        self.compute_score = compute_score or default_compute_score
+        self.reward_fn_key = reward_fn_key  # Store the key for accessing the data source
     
-    def __call__(self, data: DataProto, return_dict: bool = False) -> torch.Tensor | dict[str, Any]:
+    def __call__(self, data: DataProto, return_dict: bool = False, is_train: bool = True) -> torch.Tensor | dict[str, Any]:
         """We will expand this function gradually based on the available datasets"""
 
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
@@ -102,12 +99,31 @@ class CustomRewardManager(AbstractRewardManager):
             extra_info["num_turns"] = num_turns
 
             # calculate custom reward
-            valid_target_length = data_item.batch['target_attention_mask'].sum()
-            length_penalty = 1.0 / valid_target_length
-            item_logp = data_item.batch["m_log_probs"]
+            length_penalty = valid_response_length / 2000
+
+            if is_train:
+                valid_target_length = data_item.batch['target_attention_mask'].sum()
+                item_logp = data_item.batch["m_log_probs"]
             
-            avg_logp = item_logp[:valid_target_length].mean().item()
-            reward = self.length_weight * length_penalty - self.logp_weight * avg_logp 
+                avg_logp = item_logp[:valid_target_length].mean()
+                reward = torch.exp(avg_logp) - length_penalty
+            else:
+                m_response = data_item.non_tensor_batch["m_raw_responses"]
+                score = self.compute_score(
+                    data_source=data_source,
+                    solution_str=m_response,
+                    ground_truth=ground_truth,
+                    extra_info=extra_info,
+                )
+
+                if isinstance(score, dict):
+                    reward = score["score"]
+                    # Store the information including original reward
+                    for key, value in score.items():
+                        reward_extra_info[key].append(value)
+                else:
+                    reward = score
+            
             reward_tensor[i, valid_response_length - 1] = reward
 
             if data_source not in already_print_data_sources:

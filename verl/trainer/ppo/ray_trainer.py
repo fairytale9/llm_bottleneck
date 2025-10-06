@@ -77,7 +77,7 @@ class Role(Enum):
     RefPolicy = 4
     RewardModel = 5
     ActorRolloutRef = 6
-    Translator = 7
+    Translator = 7 #ActorRollout
 
 
 @dataclass
@@ -211,6 +211,14 @@ def compute_response_mask(data: DataProto):
     attention_mask = data.batch["attention_mask"]
     return attention_mask[:, -response_length:]
 
+def decode_response(data: DataProto, tokenizer):
+    response_list = []
+    for i in range(len(data)):
+        data_item = data[i]  # DataProtoItem
+        response_ids = data_item.batch["input_ids"]
+        response_str = tokenizer.decode(response_ids, skip_special_tokens=True)
+        response_list.append(response_str)
+    return np.array(response_list, dtype=object)
 
 def compute_advantage(
     data: DataProto,
@@ -720,11 +728,18 @@ class RayPPOTrainer:
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
+            
+            # m inference
+            test_batch.non_tensor_batch["raw_responses"] = decode_response(batch, self.tokenizer) # prompt + M_response
+            if self.use_translator:
+                with marked_timer("translator_generation", timing_raw, color="orange"):
+                    test_batch = self.translator_wg.generate(test_batch)
+                    m_responses = test_batch.non_tensor_batch["m_raw_responses"]
 
             # evaluate using reward_function
             if self.val_reward_fn is None:
                 raise ValueError("val_reward_fn must be provided for validation.")
-            result = self.val_reward_fn(test_batch, return_dict=True)
+            result = self.val_reward_fn(test_batch, return_dict=True, is_train=False)
             reward_tensor = result["reward_tensor"]
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
@@ -839,7 +854,7 @@ class RayPPOTrainer:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Translator)
             translator_cls = RayClassWithInitArgs(
                 self.role_worker_mapping[Role.Translator], 
-                config=self.config.get('translator', {})
+                config=self.config.get('translator', {}),
             )
             self.resource_pool_to_cls[resource_pool]["translator"] = translator_cls
 
@@ -1115,6 +1130,19 @@ class RayPPOTrainer:
         next_step_profile = False
 
         for epoch in range(self.config.trainer.total_epochs):
+            # at the beginning of each epoch, train m on the whole dataset
+            #if self.use_translator:
+            #    with marked_timer("translator_update", timing_raw, color="orange"):
+            #        translator_output = self.translator_wg.update_translator(batch)
+            #        #translator_metrics = reduce_metrics(translator_output.meta_info["metrics"])
+                    #metrics.update(translator_metrics)
+
+            #    with marked_timer("translator_compute_log_prob", timing_raw, color="green"):
+            #        m_batch = self.translator_wg.compute_log_prob(batch)
+            #        batch = batch.union(m_batch)
+            #for m_epoch in range(1): # how many epoches of training m before training M
+            
+
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
@@ -1174,6 +1202,10 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
+
+                    # decode responses
+                    if "raw_responses" not in batch.batch.keys():
+                        batch.non_tensor_batch["raw_responses"] = decode_response(batch, self.tokenizer)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
