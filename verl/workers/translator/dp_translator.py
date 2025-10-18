@@ -76,42 +76,6 @@ class DataParallelPPOTranslator(BasePPOTranslator):
         else:
             self.translator_optimizer.step()
         return grad_norm
-    
-    def _old_process_micro_batch(self, micro_batch, temperature, is_train=False, calculate_entropy=False):
-        prompt_length = micro_batch["prompts"].size(-1)
-        response_attention_mask = micro_batch["attention_mask"][:, prompt_length:]
-        responses = micro_batch["responses"]
-        targets = micro_batch["target_ids"]
-        target_length = targets.size(-1)
-        targets_attention_mask = micro_batch["target_attention_mask"]
-        
-        input_ids = torch.cat((responses, targets), dim=1)
-        attention_mask = torch.cat((response_attention_mask, targets_attention_mask), dim=1)
-
-        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
-            entropy = None
-            print(f"Successfully executed utill this step!")
-            output = self.translator_module(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                use_cache=False,
-            )  # prevent model thinks we are generating
-
-            logits = output.logits
-            logits.div_(temperature)
-            
-            # Extract logits for target tokens (at the end of the sequence)
-            target_logits = logits[:, -target_length-1:-1, :]  # (bsz, target_length, vocab_size)
-            if is_train:
-                return target_logits, targets, targets_attention_mask
-            
-            # compute log probabilities for the target tokens
-            log_probs = logprobs_from_logits(target_logits, targets)
-            
-            if calculate_entropy:
-                entropy = torch.distributions.Categorical(logits=target_logits).entropy()  # (bsz, target_length)
-
-        return entropy, log_probs
 
     def _process_micro_batch(self, micro_batch, temperature, is_train=False, calculate_entropy=False):
         reasoning_ids_list = []
@@ -126,7 +90,7 @@ class DataParallelPPOTranslator(BasePPOTranslator):
             r_input_ids, r_attention_mask = verl_F.tokenize_and_postprocess_data(
                 prompt=response_str,
                 tokenizer=self.tokenizer,
-                max_length=3072,
+                max_length=4608,
                 pad_token_id=self.tokenizer.pad_token_id,
                 left_pad=True,
                 truncation='right'

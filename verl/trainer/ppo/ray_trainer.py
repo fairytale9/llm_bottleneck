@@ -215,7 +215,7 @@ def decode_response(data: DataProto, tokenizer):
     response_list = []
     for i in range(len(data)):
         data_item = data[i]  # DataProtoItem
-        response_ids = data_item.batch["input_ids"]
+        response_ids = data_item.batch["responses"]
         response_str = tokenizer.decode(response_ids, skip_special_tokens=True)
         response_list.append(response_str)
     return np.array(response_list, dtype=object)
@@ -964,6 +964,17 @@ class RayPPOTrainer:
                 critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep
             )
 
+        if self.use_translator:
+            translator_local_path = os.path.join(local_global_step_folder, "translator")
+            translator_remote_path = (
+                None
+                if self.config.trainer.default_hdfs_dir is None
+                else os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "translator")
+            )
+            self.translator_wg.save_checkpoint(
+                translator_local_path, translator_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep
+            )
+
         # save dataloader
         local_mkdir_safe(local_global_step_folder)
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
@@ -1015,6 +1026,7 @@ class RayPPOTrainer:
 
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, "critic")
+        translator_path = os.path.join(global_step_folder, "translator")
         # load actor
         self.actor_rollout_wg.load_checkpoint(
             actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
@@ -1023,6 +1035,11 @@ class RayPPOTrainer:
         if self.use_critic:
             self.critic_wg.load_checkpoint(
                 critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
+            )
+        # load translator
+        if self.use_translator:
+            self.translator_wg.load_checkpoint(
+                translator_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
             )
 
         # load dataloader,
@@ -1225,12 +1242,15 @@ class RayPPOTrainer:
                     if self.use_translator:
                         with marked_timer("translator_update", timing_raw, color="orange"):
                             translator_output = self.translator_wg.update_translator(batch)
-                            #translator_metrics = reduce_metrics(translator_output.meta_info["metrics"])
-                            #metrics.update(translator_metrics)
+                        translator_metrics = reduce_metrics(translator_output.meta_info["metrics"])
+                        metrics.update(translator_metrics)
 
                         with marked_timer("translator_compute_log_prob", timing_raw, color="green"):
                             m_batch = self.translator_wg.compute_log_prob(batch)
                             batch = batch.union(m_batch)
+                            m_logps = agg_loss(loss_mat=batch.batch["m_log_probs"], loss_mask=batch.batch["target_attention_mask"], loss_agg_mode="seq-mean-token-mean")
+                            m_log_prob_metrics = {"translator/logp": m_logps.detach().item()}
+                            metrics.update(m_log_prob_metrics)
 
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score

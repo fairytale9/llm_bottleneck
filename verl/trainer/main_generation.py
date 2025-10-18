@@ -135,6 +135,7 @@ def main_task(config):
                 output_texts.append(response_str)
 
             output_lst[n_sample].extend(output_texts)
+        break # we only evaluate one batch
 
     # convert output_lst from (n_samples, n_data) to (n_data, n_sampels)
     output_lst = np.array(output_lst, dtype=object)

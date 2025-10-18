@@ -92,6 +92,9 @@ class CustomRewardManager(AbstractRewardManager):
             prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
             response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
 
+            if i==0:
+                print(f"Prompt: {prompt_str}\nResponse: {response_str}")
+
             ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
             data_source = data_item.non_tensor_batch[self.reward_fn_key]
             extra_info = data_item.non_tensor_batch.get("extra_info", {})
@@ -99,7 +102,7 @@ class CustomRewardManager(AbstractRewardManager):
             extra_info["num_turns"] = num_turns
 
             # calculate custom reward
-            length_penalty = valid_response_length / 2000
+            length_penalty = valid_response_length / 4000
 
             if is_train:
                 valid_target_length = data_item.batch['target_attention_mask'].sum()

@@ -1777,82 +1777,6 @@ class TranslatorWorker(Worker, DistProfilerExtension):
             )
         self._is_lora = self.config.model.get("lora_rank", 0) > 0
 
-    def _build_rollout(self, trust_remote_code=False):
-        from torch.distributed.device_mesh import init_device_mesh
-
-        # TODO(sgm): support FSDP hybrid shard for larger model
-        infer_tp = self.config.rollout.tensor_model_parallel_size
-        dp = self.world_size // infer_tp
-        assert self.world_size % infer_tp == 0, (
-            f"rollout world_size: {self.world_size} is not divisible by infer_tp: {infer_tp}"
-        )
-        rollout_device_mesh = init_device_mesh(
-            device_name, mesh_shape=(dp, infer_tp), mesh_dim_names=["dp", "infer_tp"]
-        )
-        rollout_name = self.config.rollout.name
-
-        if rollout_name == "hf":
-            self._register_dispatch_collect_info("rollout", dp_rank=self.rank, is_collect=True)
-        else:
-            is_collect = rollout_device_mesh["infer_tp"].get_local_rank() == 0
-            self._register_dispatch_collect_info(
-                "rollout", dp_rank=rollout_device_mesh["dp"].get_local_rank(), is_collect=is_collect
-            )
-
-        rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
-        model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model, dataclass_type=HFModelConfig)
-
-        # build rollout worker inside hybrid engine
-        log_gpu_memory_usage(f"Before building {rollout_name} rollout", logger=logger)
-        rollout_worker = RolloutWorker(config=rollout_config, model_config=model_config)
-        log_gpu_memory_usage(f"After building {rollout_name} rollout", logger=logger)
-
-        if rollout_name == "vllm":
-            from verl.workers.sharding_manager.fsdp_vllm import FSDPVLLMShardingManager
-
-            full_params = torch.distributed.get_world_size() == 1
-            rollout_sharding_manager = FSDPVLLMShardingManager(
-                module=self.translator_module,
-                inference_engine=rollout_worker.rollout.inference_engine,
-                model_config=self.translator_model_config,
-                rollout_config=self.config.rollout,
-                full_params=full_params,
-                device_mesh=rollout_device_mesh,
-                offload_param=self._is_offload_param,
-                load_format=self.config.rollout.load_format,
-                layered_summon=self.config.rollout.get("layered_summon", False),
-            )
-            log_gpu_memory_usage("After building sharding manager", logger=logger)
-
-        elif rollout_name == "sglang":
-            # NOTE(linjunrong): Due to recent fp8 support in SGLang. Now importing any symbol relate to
-            # SGLang's model_runner would check CUDA device capability. However, due to verl's setting,
-            # the main process of ray can not find any CUDA device, which would potentially lead to:
-            # "RuntimeError: No CUDA GPUs are available".
-            # For this reason, sharding_manager.__init__ should not import FSDPSGLangShardingManager and
-            # we import it here use the abs path.
-            # check: https://github.com/sgl-project/sglang/blob/00f42707eaddfc2c0528e5b1e0094025c640b7a0/python/sglang/srt/layers/quantization/fp8_utils.py#L76
-            from verl.workers.sharding_manager.fsdp_sglang import FSDPSGLangShardingManager
-
-            if torch.distributed.get_world_size() == 1:
-                self.config.rollout.load_format = "dummy_hf"
-            rollout_sharding_manager = FSDPSGLangShardingManager(
-                module=self.translator_module,
-                inference_engine=rollout_worker.rollout._engine,
-                model_config=self.translator_model_config,
-                rollout_config=self.config.rollout,
-                full_params="hf" in self.config.rollout.load_format,
-                device_mesh=rollout_device_mesh,
-                offload_param=self._is_offload_param,
-                multi_stage_wake_up=self.config.rollout.multi_stage_wake_up,
-            )
-            log_gpu_memory_usage("After building sharding manager", logger=logger)
-
-        else:
-            raise NotImplementedError(f"Rollout name: {self.config.rollout.name} is not supported")
-
-        return rollout_worker, rollout_sharding_manager
-
     def _build_translator_model_optimizer(self, config):
         # the following line is necessary
         from torch import optim
@@ -2068,12 +1992,6 @@ class TranslatorWorker(Worker, DistProfilerExtension):
             translator_tokenizer=self.tokenizer
         )
 
-        # Initialize rollout if configured
-        if hasattr(self.config, 'rollout') and self.config.rollout is not None:
-            self.rollout, self.rollout_sharding_manager = self._build_rollout(
-                trust_remote_code=self.config.model.get("trust_remote_code", False)
-            )
-
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.translator_module)
             log_gpu_memory_usage("After offload translator model during init", logger=logger)
@@ -2089,31 +2007,6 @@ class TranslatorWorker(Worker, DistProfilerExtension):
             processing_class=self.processor if self.processor is not None else self.tokenizer,
             checkpoint_config=self.config.checkpoint,
         )
-
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="translator"))
-    @DistProfiler.annotate(color="green")
-    def translate(self, data: DataProto):
-        if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.translator_module)
-        
-        micro_batch_size = self.config.forward_micro_batch_size_per_gpu
-        data.meta_info["micro_batch_size"] = micro_batch_size
-        data.meta_info["max_token_len"] = self.config.forward_max_token_len_per_gpu
-        data.meta_info["use_dynamic_bsz"] = self.config.use_dynamic_bsz
-        
-        # perform translation computation - compute log probabilities of translations
-        with self.ulysses_sharding_manager:
-            data = data.to("cpu")  # data will to device with each micro batch on translator.compute_log_prob
-            log_probs, entropys = self.translator.compute_log_prob(data=data, calculate_entropy=True)
-            output = DataProto.from_dict(
-                tensors={"log_probs": log_probs, "entropys": entropys},
-                meta_info={"temperature": self.config.temperature},
-            )
-
-        output = output.to("cpu")
-        if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.translator_module)
-        return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="translator"))
     @DistProfiler.annotate(color="orange")
@@ -2185,74 +2078,6 @@ class TranslatorWorker(Worker, DistProfilerExtension):
             offload_fsdp_model_to_cpu(self.translator_module)
             log_gpu_memory_usage("After offload translator model during compute_log_prob", logger=logger)
 
-        return output
-
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
-    @DistProfiler.annotate(color="red", role="translator_generate")
-    def generate(self, data: DataProto):
-        """Generate sequences using vLLM based on raw_responses in the input data.
-        
-        Args:
-            data: DataProto containing raw_responses in non_tensor_batch
-            
-        Returns:
-            DataProto with generated sequences in m_raw_responses
-        """
-        # Support all hardwares
-        data = data.to(get_device_id())
-
-        # Check if rollout is available
-        if not hasattr(self, 'rollout') or self.rollout is None:
-            raise RuntimeError("Rollout not initialized. Make sure rollout config is provided.")
-
-        timing_generate = {}
-        with self.rollout_sharding_manager:
-            log_gpu_memory_usage("After entering translator rollout sharding manager", logger=logger)
-
-            with simple_timer("generate_sequences", timing_generate):
-                # Extract raw_responses from the input data
-                raw_responses = data.non_tensor_batch.get("raw_responses", [])
-                if not raw_responses:
-                    raise ValueError("No raw_responses found in input data")
-                
-                # Create prompts from raw_responses
-                prompts = DataProto.from_dict(
-                    non_tensor_batch={"raw_prompt": raw_responses}
-                )
-                
-                # Generate sequences using the rollout worker
-                output = self.rollout.generate_sequences(prompts=prompts)
-
-            log_gpu_memory_usage("After translator generation", logger=logger)
-
-        timing_generate.update(self.rollout_sharding_manager.timing)
-        # We calculate the average timing across all ranks
-        # to make sure meta_info["timing"] is the same
-        timing_generate_topk_ratio, timing_generate_min, timing_generate_max = topk_reduce_ratio_min_max(
-            timing_generate["generate_sequences"]
-        )
-        timing_generate = reduce_timing(timing_generate)
-        timing_generate.update(
-            {
-                "generation_timing/max": timing_generate_max,
-                "generation_timing/min": timing_generate_min,
-                "generation_timing/topk_ratio": timing_generate_topk_ratio,
-            }
-        )
-        
-        # Extract the generated responses and add them as m_raw_responses
-        generated_responses = output.non_tensor_batch.get("raw_prompt", [])
-        
-        # Create output DataProto with m_raw_responses
-        output = DataProto.from_dict(
-            non_tensor_batch={"m_raw_responses": generated_responses},
-            meta_info={"timing": timing_generate}
-        )
-        
-        output = output.to("cpu")
-
-        # clear kv cache
-        get_torch_device().empty_cache()
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
