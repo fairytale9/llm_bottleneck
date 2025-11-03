@@ -109,7 +109,7 @@ class CustomRewardManager(AbstractRewardManager):
                 item_logp = data_item.batch["m_log_probs"]
             
                 avg_logp = item_logp[:valid_target_length].mean()
-                reward = torch.exp(avg_logp) - length_penalty
+                reward = torch.exp(avg_logp) # - length_penalty
             else:
                 m_response = data_item.non_tensor_batch["m_raw_responses"]
                 score = self.compute_score(

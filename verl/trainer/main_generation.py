@@ -58,6 +58,9 @@ def run_generation(config) -> None:
 
     ray.get(main_task.remote(config))
 
+def get_reasoning_part(s):
+    parts = s.split("</think>")
+    return parts[0]
 
 @ray.remote(num_cpus=1)
 def main_task(config):
@@ -74,16 +77,27 @@ def main_task(config):
 
     # read dataset. Note that the dataset should directly contain chat template format (e.g., a list of dictionary)
     dataset = pd.read_parquet(config.data.path)
+
+    dataset = dataset.sample(n=1000, random_state=44)
+    dataset = dataset.reset_index(drop=True)
+
     chat_lst = dataset[config.data.prompt_key].tolist()
 
     chat_lst = [chat.tolist() for chat in chat_lst]
+
+    # get M responses
+    M_responses = dataset["M_responses"]
+    M_responses = dataset["M_responses"].tolist()
+    M_responses = [chat.tolist() for chat in M_responses]
+    # get reasoning parts
+    M_reasoning = [get_reasoning_part(s[0]) for s in M_responses]
 
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     ray_cls_with_init = RayClassWithInitArgs(cls=ray.remote(ActorRolloutRefWorker), config=config, role="rollout")
-    resource_pool = RayResourcePool(process_on_nodes=[config.trainer.n_gpus_per_node] * config.trainer.nnodes)
+    resource_pool = RayResourcePool(process_on_nodes=[config.trainer.n_gpus_per_node] * config.trainer.nnodes, max_colocate_count=1)
     wg = RayWorkerGroup(
         resource_pool=resource_pool,
         ray_cls_with_init=ray_cls_with_init,
@@ -100,8 +114,13 @@ def main_task(config):
     for batch_idx in range(num_batch):
         print(f"[{batch_idx + 1}/{num_batch}] Start to process.")
         batch_chat_lst = chat_lst[batch_idx * config_batch_size : (batch_idx + 1) * config_batch_size]
+
+        # formulate reasoning conditional prompt
+        batch_M_reasoning_lst = M_reasoning[batch_idx * config_batch_size : (batch_idx + 1) * config_batch_size]
+        batch_prompt = [[{"content": batch_chat_lst[i][0]['content']+ " "+ batch_M_reasoning_lst[i] + "You are given a problem and a reasoning process. Do NOT re-derive the solution. Based only on the reasoning above, output the final answer:", "role": "user"}] for i in range(len(batch_chat_lst))]
+
         inputs = tokenizer.apply_chat_template(
-            batch_chat_lst,
+            batch_prompt,
             add_generation_prompt=True,
             padding=True,
             truncation=True,
@@ -109,6 +128,7 @@ def main_task(config):
             return_tensors="pt",
             return_dict=True,
             tokenize=True,
+            enable_thinking=False,
             **apply_chat_template_kwargs,
         )
         input_ids = inputs["input_ids"]
@@ -135,14 +155,13 @@ def main_task(config):
                 output_texts.append(response_str)
 
             output_lst[n_sample].extend(output_texts)
-        break # we only evaluate one batch
 
     # convert output_lst from (n_samples, n_data) to (n_data, n_sampels)
     output_lst = np.array(output_lst, dtype=object)
     output_lst = np.transpose(output_lst, axes=(1, 0)).tolist()
 
     # add to the data frame
-    dataset["responses"] = output_lst
+    dataset["m_responses"] = output_lst
 
     # write to a new parquet
     output_dir = os.path.dirname(config.data.output_path)

@@ -28,6 +28,7 @@ from tqdm import tqdm
 
 from verl.trainer.ppo.reward import get_custom_reward_fn
 from verl.utils.fs import copy_to_local
+from verl.utils.reward_score import default_compute_score
 
 
 @ray.remote
@@ -54,6 +55,11 @@ def main(config):
     # evaluate test_score based on data source
     data_source_reward = defaultdict(list)
     compute_score = get_custom_reward_fn(config)
+    
+    # Fallback to default_compute_score if no custom reward function is provided
+    if compute_score is None:
+        compute_score = default_compute_score
+        print("No custom reward function specified, using default_compute_score")
 
     # Create remote tasks
     remote_tasks = [

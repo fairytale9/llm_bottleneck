@@ -81,14 +81,15 @@ class DataParallelPPOTranslator(BasePPOTranslator):
         reasoning_ids_list = []
         reasoning_mask_list = []
         for response_str in micro_batch["raw_responses"]:
-            #match = re.search(r"<think>(.*?)</think>", response_str, re.DOTALL)
-            #if match:
-            #    reasoning = match.group(1)
-            #    print(reasoning)
-             
+            match = re.search(r"<think>(.*?)</think>", response_str, re.DOTALL)
+            if match:
+                reasoning = match.group(1)
+            else:
+                reasoning = response_str
+            
             # Tokenize the conditional prompt
             r_input_ids, r_attention_mask = verl_F.tokenize_and_postprocess_data(
-                prompt=response_str,
+                prompt=reasoning,
                 tokenizer=self.tokenizer,
                 max_length=4608,
                 pad_token_id=self.tokenizer.pad_token_id,

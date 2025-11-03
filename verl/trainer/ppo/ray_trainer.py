@@ -215,7 +215,7 @@ def decode_response(data: DataProto, tokenizer):
     response_list = []
     for i in range(len(data)):
         data_item = data[i]  # DataProtoItem
-        response_ids = data_item.batch["responses"]
+        response_ids = data_item.batch["input_ids"]
         response_str = tokenizer.decode(response_ids, skip_special_tokens=True)
         response_list.append(response_str)
     return np.array(response_list, dtype=object)
@@ -1240,11 +1240,6 @@ class RayPPOTrainer:
                     # Translator worker method calls here
                     # Calculate logp of targets; Update itself
                     if self.use_translator:
-                        with marked_timer("translator_update", timing_raw, color="orange"):
-                            translator_output = self.translator_wg.update_translator(batch)
-                        translator_metrics = reduce_metrics(translator_output.meta_info["metrics"])
-                        metrics.update(translator_metrics)
-
                         with marked_timer("translator_compute_log_prob", timing_raw, color="green"):
                             m_batch = self.translator_wg.compute_log_prob(batch)
                             batch = batch.union(m_batch)
@@ -1337,6 +1332,13 @@ class RayPPOTrainer:
                             critic_output = self.critic_wg.update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
+
+                    # update m
+                    if self.use_translator:
+                        with marked_timer("translator_update", timing_raw, color="orange"):
+                            translator_output = self.translator_wg.update_translator(batch)
+                        translator_metrics = reduce_metrics(translator_output.meta_info["metrics"])
+                        metrics.update(translator_metrics)
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:

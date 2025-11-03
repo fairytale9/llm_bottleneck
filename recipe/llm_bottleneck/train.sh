@@ -54,7 +54,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name='llm-bottleneck' \
-    trainer.experiment_name='bs_128_length_4096_full_training_distill_1.5b_no_prompt_to_m' \
+    trainer.experiment_name='bs_128_length_4096_no_prompt_to_m_only_pass_reasoning_no_length_penalty' \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=200 \
