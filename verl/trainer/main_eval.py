@@ -78,9 +78,13 @@ def main(config):
 
     metric_dict = {}
     for data_source, rewards in data_source_reward.items():
+        dataset["m_eval_results"] = rewards
         metric_dict[f"test_score/{data_source}"] = np.mean(rewards)
 
     print(metric_dict)
+
+    # save dataset with eval results
+    dataset.to_parquet(config.data.path)
 
 
 if __name__ == "__main__":

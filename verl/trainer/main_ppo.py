@@ -164,12 +164,27 @@ class TaskRunner:
     def init_resource_pool_mgr(self, config):
         """Initialize resource pool manager."""
         global_pool_id = "global_pool"
-        resource_pool_spec = {
-            global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
-        }
-        self.mapping[Role.ActorRollout] = global_pool_id
-        self.mapping[Role.Critic] = global_pool_id
-        self.mapping[Role.Translator] = global_pool_id
+        translator_pool_id = "translator_pool"
+        
+        actor_gpus = config.trainer.n_gpus_per_node
+        translator_gpus = config.trainer.get("translator_n_gpus_per_node", 0)
+        
+        if translator_gpus > 0:
+            resource_pool_spec = {
+                global_pool_id: [actor_gpus] * config.trainer.nnodes,
+                translator_pool_id: [translator_gpus] * config.trainer.nnodes,
+            }
+            self.mapping[Role.ActorRollout] = global_pool_id
+            self.mapping[Role.Critic] = global_pool_id
+            self.mapping[Role.Translator] = translator_pool_id
+        else:
+            resource_pool_spec = {
+                global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
+            }
+            self.mapping[Role.ActorRollout] = global_pool_id
+            self.mapping[Role.Critic] = global_pool_id
+            self.mapping[Role.Translator] = global_pool_id
+            
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
@@ -195,9 +210,20 @@ class TaskRunner:
 
     def add_translator_worker(self, config):
         """Add translator worker for policy updates."""
-        from verl.workers.fsdp_workers import TranslatorWorker
+        #from verl.workers.fsdp_workers import TranslatorWorker
         # Use TranslatorWorker which mirrors actor-rollout initialization
-        self.role_worker_mapping[Role.Translator] = ray.remote(TranslatorWorker)
+        #self.role_worker_mapping[Role.Translator] = ray.remote(TranslatorWorker)
+        # Use ActorRolloutRefWorker which mirrors actor-rollout initialization
+        if config.translator.actor.strategy in {"fsdp", "fsdp2"}:
+            from verl.workers.fsdp_workers import ActorRolloutRefWorker
+            translator_cls = ActorRolloutRefWorker
+        elif config.translator.actor.strategy == "megatron":
+            from verl.workers.megatron_workers import ActorRolloutRefWorker
+            translator_cls = ActorRolloutRefWorker
+        else:
+            raise NotImplementedError
+            
+        self.role_worker_mapping[Role.Translator] = ray.remote(translator_cls)
         self.mapping[Role.Translator] = "global_pool"
 
     def run(self, config):
@@ -281,6 +307,7 @@ class TaskRunner:
         trainer = RayPPOTrainer(
             config=config,
             tokenizer=tokenizer,
+            m_tokenizer=m_tokenizer,
             processor=processor,
             role_worker_mapping=self.role_worker_mapping,
             resource_pool_manager=resource_pool_manager,

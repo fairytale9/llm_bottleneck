@@ -112,17 +112,33 @@ class SFTDataset(Dataset):
             self.responses = self.responses.squeeze()
         self.responses = self.responses.tolist()
 
+        if "responses" in self.dataframe.keys():
+            self.M_responses = self.dataframe["responses"]
+            self.M_responses = self.M_responses.apply(lambda x: series_to_item(x))
+            self.M_responses = self.M_responses.tolist()
+        else:
+            self.M_responses = []
+
     def __len__(self):
         return len(self.prompts)
+
+    def _get_reasoning_part(self, s):
+        parts = s.split("</think>")
+        return parts[0]
 
     def __getitem__(self, item):
         tokenizer = self.tokenizer
 
         prompt = self.prompts[item]
         response = self.responses[item]
+        if self.M_responses:
+            M_response = self.M_responses[item]
+            M_reasoning = self._get_reasoning_part(M_response)
+        else:
+            M_reasoning = ""
 
         # apply chat template
-        prompt_chat = [{"role": "user", "content": prompt}]
+        prompt_chat = [{"role": "user", "content": "Question: "+prompt+"\nReasoning: "+M_reasoning+"\nYou are given a question and a reasoning process. Do NOT re-derive the solution. Based only on the reasoning above, output the final answer:"}]
 
         # string
         prompt_chat_str = tokenizer.apply_chat_template(

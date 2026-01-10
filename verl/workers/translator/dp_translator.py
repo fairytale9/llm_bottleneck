@@ -80,16 +80,24 @@ class DataParallelPPOTranslator(BasePPOTranslator):
     def _process_micro_batch(self, micro_batch, temperature, is_train=False, calculate_entropy=False):
         reasoning_ids_list = []
         reasoning_mask_list = []
-        for response_str in micro_batch["raw_responses"]:
-            match = re.search(r"<think>(.*?)</think>", response_str, re.DOTALL)
-            if match:
-                reasoning = match.group(1)
-            else:
-                reasoning = response_str
+        for response_str, prompt_str in zip(micro_batch["raw_responses"], micro_batch["raw_prompts"]):
+            parts = response_str.split("</think>")
+            reasoning = parts[0]
+            prompt_chat_str = prompt_str + reasoning + "</think>\nYou are given a question and a reasoning process. Do NOT re-derive the solution. Based only on the reasoning above, output the final answer:"
+            #prompt_chat = [{"content": "Question: "+prompt_str+"\nReasoning: "+response_str+"</think>\nYou are given a question and a reasoning process. Do NOT re-derive the solution. Based only on the reasoning above, output the final answer:", "role": "user"}]
+            #prompt_chat_str = self.tokenizer.apply_chat_template(
+            #    prompt_chat, add_generation_prompt=True, tokenize=False, enable_reasoning=False
+            #)
+            print(f"Prompt chat str: {prompt_chat_str}")
+            #match = re.search(r"<think>(.*?)</think>", response_str, re.DOTALL)
+            #if match:
+            #    reasoning = match.group(1)
+            #else:
+            #    reasoning = response_str
             
             # Tokenize the conditional prompt
             r_input_ids, r_attention_mask = verl_F.tokenize_and_postprocess_data(
-                prompt=reasoning,
+                prompt=prompt_chat_str,
                 tokenizer=self.tokenizer,
                 max_length=4608,
                 pad_token_id=self.tokenizer.pad_token_id,
@@ -141,7 +149,7 @@ class DataParallelPPOTranslator(BasePPOTranslator):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
 
         select_keys = ["target_ids", "target_attention_mask"]
-        non_tensor_select_keys = ["raw_responses"]
+        non_tensor_select_keys = ["raw_responses", "raw_prompts"]
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
         micro_batches = data.split(micro_batch_size)
@@ -172,8 +180,15 @@ class DataParallelPPOTranslator(BasePPOTranslator):
         self.translator_module.train()
         metrics = {}
 
-        select_keys = ["target_ids", "target_attention_mask"] # "prompts", "responses", "attention_mask"
-        non_tensor_select_keys = ["raw_responses"]
+        if "advantages" in data.batch:
+            # RL Training
+            select_keys = ["target_ids", "target_attention_mask", "old_log_probs", "advantages"]
+            non_tensor_select_keys = ["raw_responses", "raw_prompts"]
+        else:
+            # SFT Training
+            select_keys = ["target_ids", "target_attention_mask"] # "prompts", "responses", "attention_mask"
+            non_tensor_select_keys = ["raw_responses", "raw_prompts"]
+        
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
         # Split to make minibatch iterator for updating the translator
@@ -193,31 +208,63 @@ class DataParallelPPOTranslator(BasePPOTranslator):
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
 
-                    logits, targets, loss_mask = self._process_micro_batch(model_inputs, temperature=1.0, is_train=True)
-                    
-                    logits = logits.contiguous()
-                    targets = targets.contiguous()
-                    loss_mask = loss_mask.contiguous().view(-1)
+                    if "advantages" in micro_batch.batch:
+                        # RL Update
+                        entropy, log_probs = self._process_micro_batch(
+                            model_inputs, temperature=1.0, is_train=False, calculate_entropy=True
+                        )
+                        old_log_probs = micro_batch.batch["old_log_probs"]
+                        advantages = micro_batch.batch["advantages"]
+                        response_mask = micro_batch.batch["target_attention_mask"]
 
-                    # calculate cross-entropy loss
-                    loss_fn = torch.nn.CrossEntropyLoss(reduction='none')
-                    loss = loss_fn(
-                        logits.view(-1, logits.size(-1)), 
-                        targets.view(-1)
-                    )
-                    loss = loss * loss_mask
-                    loss = torch.sum(loss) / torch.sum(loss_mask)
-                    loss_scale_factor = 1 / self.gradient_accumulation
-                    loss = loss * loss_scale_factor
-                    
-                    loss.backward()
+                        pg_loss, clipfrac, approx_kl, _ = core_algos.compute_policy_loss(
+                             old_log_prob=old_log_probs,
+                             log_prob=log_probs,
+                             advantages=advantages,
+                             response_mask=response_mask,
+                             loss_agg_mode="token-mean", # Use default or config
+                             config=self.config
+                        )
+                         
+                        loss = pg_loss - self.config.entropy_coef * masked_mean(entropy, response_mask)
+                        
+                        loss_scale_factor = 1 / self.gradient_accumulation
+                        loss = loss * loss_scale_factor
+                        loss.backward()
+                         
+                        micro_batch_metrics.update({
+                             "translator/pg_loss": pg_loss.item(),
+                             "translator/entropy": masked_mean(entropy, response_mask).item(),
+                             "translator/approx_kl": approx_kl.item()
+                        })
 
-                    micro_batch_metrics.update(
-                        {
-                            "translator/loss": loss.detach().item(),
-                            #"translator/logits_mean": masked_mean(logits, response_mask).detach().item(),
-                        }
-                    )
+                    else:
+                        # SFT Update
+                        logits, targets, loss_mask = self._process_micro_batch(model_inputs, temperature=1.0, is_train=True)
+                        
+                        logits = logits.contiguous()
+                        targets = targets.contiguous()
+                        loss_mask = loss_mask.contiguous().view(-1)
+
+                        # calculate cross-entropy loss
+                        loss_fn = torch.nn.CrossEntropyLoss(reduction='none')
+                        loss = loss_fn(
+                            logits.view(-1, logits.size(-1)), 
+                            targets.view(-1)
+                        )
+                        loss = loss * loss_mask
+                        loss = torch.sum(loss) / torch.sum(loss_mask)
+                        loss_scale_factor = 1 / self.gradient_accumulation
+                        loss = loss * loss_scale_factor
+                        
+                        loss.backward()
+
+                        micro_batch_metrics.update(
+                            {
+                                "translator/loss": loss.detach().item(),
+                                #"translator/logits_mean": masked_mean(logits, response_mask).detach().item(),
+                            }
+                        )
 
                     append_to_dict(metrics, micro_batch_metrics)
 
@@ -232,12 +279,65 @@ class DataParallelPPOTranslator(BasePPOTranslator):
     def generate(self, data: DataProto):
         self.translator_module.eval()
 
-        micro_batch_size = data.meta_info["micro_batch_size"]
-        temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
+        temperature = data.meta_info.get("temperature", 1.0)
+        do_sample = data.meta_info.get("do_sample", False)
+        max_new_tokens = data.meta_info.get("max_new_tokens", 1024)
 
-        select_keys = ["target_ids", "target_attention_mask"]
-        non_tensor_select_keys = ["raw_responses"]
-        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
+        prompts = []
+        raw_prompts = data.non_tensor_batch["raw_prompts"]
+        raw_responses = data.non_tensor_batch["raw_responses"]
+        
+        for response_str, prompt_str in zip(raw_responses, raw_prompts):
+            if "</think>" in response_str:
+                parts = response_str.split("</think>")
+                reasoning = parts[0] + "</think>"
+            else:
+                reasoning = response_str 
+            
+            prompt_chat_str = prompt_str + reasoning + "\nYou are given a question and a reasoning process. Do NOT re-derive the solution. Based only on the reasoning above, output the final answer:"
+            prompts.append(prompt_chat_str)
+
+        input_ids_list = []
+        attention_mask_list = []
+        
+        for p in prompts:
+             ids, mask = verl_F.tokenize_and_postprocess_data(
+                prompt=p,
+                tokenizer=self.tokenizer,
+                max_length=4096, 
+                pad_token_id=self.tokenizer.pad_token_id,
+                left_pad=True,
+                truncation='left'
+            )
+             input_ids_list.append(ids[0])
+             attention_mask_list.append(mask[0])
+             
+        input_ids = torch.stack(input_ids_list).to(get_device_id())
+        attention_mask = torch.stack(attention_mask_list).to(get_device_id())
+        
+        with torch.no_grad():
+             output_ids = self.translator_module.generate(
+                 input_ids=input_ids,
+                 attention_mask=attention_mask,
+                 max_new_tokens=max_new_tokens,
+                 do_sample=do_sample,
+                 temperature=temperature,
+                 pad_token_id=self.tokenizer.pad_token_id,
+                 eos_token_id=self.tokenizer.eos_token_id,
+             )
+             
+        # Extract generated part
+        generated_sequences = output_ids[:, input_ids.shape[1]:]
+        
+        generated_texts = []
+        for seq in generated_sequences:
+            text = self.tokenizer.decode(seq, skip_special_tokens=True)
+            generated_texts.append(text)
+            
+        return DataProto.from_dict(
+            tensors={"m_responses": generated_sequences},
+            non_tensors={"m_raw_responses": generated_texts}
+        )
 
 
     def _forward_micro_batch_for_log_prob(self, micro_batch, temperature, calculate_entropy=False):

@@ -62,6 +62,8 @@ def get_reasoning_part(s):
     parts = s.split("</think>")
     return parts[0]
 
+m_PROMPT = "You are given a question and a reasoning process. Based on the reasoning process, provide a step-by-step solution.\n" #and output the final answer within \\boxed{}.\n
+
 @ray.remote(num_cpus=1)
 def main_task(config):
     pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
@@ -78,19 +80,21 @@ def main_task(config):
     # read dataset. Note that the dataset should directly contain chat template format (e.g., a list of dictionary)
     dataset = pd.read_parquet(config.data.path)
 
-    dataset = dataset.sample(n=1000, random_state=44)
-    dataset = dataset.reset_index(drop=True)
+    if not config.M_reasoning or len(dataset)>1000:
+        dataset = dataset.sample(n=1000, random_state=44)
+        dataset = dataset.reset_index(drop=True)
 
     chat_lst = dataset[config.data.prompt_key].tolist()
 
     chat_lst = [chat.tolist() for chat in chat_lst]
 
     # get M responses
-    M_responses = dataset["M_responses"]
-    M_responses = dataset["M_responses"].tolist()
-    M_responses = [chat.tolist() for chat in M_responses]
-    # get reasoning parts
-    M_reasoning = [get_reasoning_part(s[0]) for s in M_responses]
+    M_reasoning = []
+    if config.M_reasoning:
+        M_responses = dataset["M_responses"].tolist()
+        M_responses = [chat.tolist() for chat in M_responses]
+        # get reasoning parts
+        M_reasoning = [get_reasoning_part(s[0]) for s in M_responses]
 
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
@@ -116,9 +120,15 @@ def main_task(config):
         batch_chat_lst = chat_lst[batch_idx * config_batch_size : (batch_idx + 1) * config_batch_size]
 
         # formulate reasoning conditional prompt
-        batch_M_reasoning_lst = M_reasoning[batch_idx * config_batch_size : (batch_idx + 1) * config_batch_size]
-        batch_prompt = [[{"content": batch_chat_lst[i][0]['content']+ " "+ batch_M_reasoning_lst[i] + "You are given a problem and a reasoning process. Do NOT re-derive the solution. Based only on the reasoning above, output the final answer:", "role": "user"}] for i in range(len(batch_chat_lst))]
-
+        if M_reasoning:
+            batch_M_reasoning_lst = M_reasoning[batch_idx * config_batch_size : (batch_idx + 1) * config_batch_size]
+            batch_prompt = [[{"content": m_PROMPT+"Question: "+batch_chat_lst[i][0]['content']+"\nReasoning: "+batch_M_reasoning_lst[i]+"\nSolution:", "role": "user"}] for i in range(len(batch_chat_lst))]
+            #batch_prompt_str = ["<｜User｜>"+batch_chat_lst[i][0]['content']+"<｜Assistant｜><think>\n"+batch_M_reasoning_lst[i]+m_PROMPT for i in range(len(batch_chat_lst))]
+            #print(f"Prompt str: {batch_prompt_str[0]}")
+        else:
+            batch_prompt = batch_chat_lst
+        
+        #inputs = tokenizer(batch_prompt_str, padding=True, truncation=True, max_length=config.rollout.prompt_length, return_tensors="pt")
         inputs = tokenizer.apply_chat_template(
             batch_prompt,
             add_generation_prompt=True,
@@ -128,7 +138,6 @@ def main_task(config):
             return_tensors="pt",
             return_dict=True,
             tokenize=True,
-            enable_thinking=False,
             **apply_chat_template_kwargs,
         )
         input_ids = inputs["input_ids"]
@@ -161,7 +170,7 @@ def main_task(config):
     output_lst = np.transpose(output_lst, axes=(1, 0)).tolist()
 
     # add to the data frame
-    dataset["m_responses"] = output_lst
+    dataset[config.output_key] = output_lst
 
     # write to a new parquet
     output_dir = os.path.dirname(config.data.output_path)

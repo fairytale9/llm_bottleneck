@@ -24,6 +24,7 @@ Where:
 """
 
 from collections import defaultdict
+from operator import is_
 from typing import Any
 
 import torch
@@ -69,6 +70,13 @@ class CustomRewardManager(AbstractRewardManager):
             else:
                 return data.batch["rm_scores"]
 
+        if "m_responses" in data.batch.keys():
+            m_flag = False
+        else:
+            m_flag = True
+
+        #print(f"m_flag: {m_flag}")
+
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
         reward_extra_info = defaultdict(list)
 
@@ -84,7 +92,11 @@ class CustomRewardManager(AbstractRewardManager):
             valid_prompt_length = data_item.batch["attention_mask"][:prompt_length].sum()
             valid_prompt_ids = prompt_ids[-valid_prompt_length:]
 
-            response_ids = data_item.batch["responses"]
+            if m_flag:
+                response_ids = data_item.batch["responses"]
+            else:
+                response_ids = data_item.batch["m_responses"]
+            
             valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
             valid_response_ids = response_ids[:valid_response_length]
 
@@ -92,7 +104,7 @@ class CustomRewardManager(AbstractRewardManager):
             prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
             response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
 
-            if i==0:
+            if i==0 and is_train:
                 print(f"Prompt: {prompt_str}\nResponse: {response_str}")
 
             ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
@@ -101,31 +113,31 @@ class CustomRewardManager(AbstractRewardManager):
             num_turns = data_item.non_tensor_batch.get("__num_turns__", None)
             extra_info["num_turns"] = num_turns
 
+            score = self.compute_score(
+                data_source=data_source,
+                solution_str=response_str,
+                ground_truth=ground_truth,
+                extra_info=extra_info,
+            )
+
+            if isinstance(score, dict):
+                reward = score["score"]
+                # Store the information including original reward
+                for key, value in score.items():
+                    reward_extra_info[key].append(value)
+            else:
+                reward = score
+            
             # calculate custom reward
             length_penalty = valid_response_length / 4000
 
             if is_train:
-                valid_target_length = data_item.batch['target_attention_mask'].sum()
-                item_logp = data_item.batch["m_log_probs"]
+                #valid_target_length = data_item.batch['target_attention_mask'].sum()
+                #item_logp = data_item.batch["m_log_probs"]
             
-                avg_logp = item_logp[:valid_target_length].mean()
-                reward = torch.exp(avg_logp) # - length_penalty
-            else:
-                m_response = data_item.non_tensor_batch["m_raw_responses"]
-                score = self.compute_score(
-                    data_source=data_source,
-                    solution_str=m_response,
-                    ground_truth=ground_truth,
-                    extra_info=extra_info,
-                )
-
-                if isinstance(score, dict):
-                    reward = score["score"]
-                    # Store the information including original reward
-                    for key, value in score.items():
-                        reward_extra_info[key].append(value)
-                else:
-                    reward = score
+                #avg_logp = item_logp[:valid_target_length].mean()
+                if not m_flag:
+                    reward = reward - length_penalty
             
             reward_tensor[i, valid_response_length - 1] = reward
 
