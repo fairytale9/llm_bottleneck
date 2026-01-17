@@ -44,7 +44,7 @@ class CustomRewardManager(AbstractRewardManager):
     log probabilities stored in batch.batch["m_logp"] by the TranslatorWorker.
     """
     
-    def __init__(self, tokenizer, num_examine, compute_score=None, reward_fn_key="data_source"):
+    def __init__(self, tokenizer, m_tokenizer, num_examine, compute_score=None, reward_fn_key="data_source"):
         """
         Initialize the Custom Reward Manager.
         
@@ -56,9 +56,12 @@ class CustomRewardManager(AbstractRewardManager):
                 "data_source".
         """
         self.tokenizer = tokenizer  # Store the tokenizer for decoding token IDs
+        self.m_tokenizer = m_tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.compute_score = compute_score or default_compute_score
         self.reward_fn_key = reward_fn_key  # Store the key for accessing the data source
+
+        self.alpha = 1 / 2000 # length penalty
     
     def __call__(self, data: DataProto, return_dict: bool = False, is_train: bool = True) -> torch.Tensor | dict[str, Any]:
         """We will expand this function gradually based on the available datasets"""
@@ -70,10 +73,21 @@ class CustomRewardManager(AbstractRewardManager):
             else:
                 return data.batch["rm_scores"]
 
-        if "m_responses" in data.batch.keys():
+        # Determine whether we should treat the batch as coming from the translator
+        # or from the actor. Validation without translator should use the actor tokenizer.
+        use_translator = None
+        if getattr(data, "meta_info", None) is not None:
+            use_translator = data.meta_info.get("use_translator")
+
+        if use_translator is False:
             m_flag = False
+            _tokenizer = self.tokenizer
+        elif "m_rewards" in data.batch.keys():
+            m_flag = False
+            _tokenizer = self.tokenizer
         else:
             m_flag = True
+            _tokenizer = self.m_tokenizer
 
         #print(f"m_flag: {m_flag}")
 
@@ -86,26 +100,18 @@ class CustomRewardManager(AbstractRewardManager):
             data_item = data[i]  # DataProtoItem
 
             prompt_ids = data_item.batch["prompts"]
-
             prompt_length = prompt_ids.shape[-1]
 
             valid_prompt_length = data_item.batch["attention_mask"][:prompt_length].sum()
             valid_prompt_ids = prompt_ids[-valid_prompt_length:]
 
-            if m_flag:
-                response_ids = data_item.batch["responses"]
-            else:
-                response_ids = data_item.batch["m_responses"]
-            
+            response_ids = data_item.batch["responses"]
             valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
             valid_response_ids = response_ids[:valid_response_length]
 
             # decode
-            prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
-            response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
-
-            if i==0 and is_train:
-                print(f"Prompt: {prompt_str}\nResponse: {response_str}")
+            prompt_str = _tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
+            response_str = _tokenizer.decode(valid_response_ids, skip_special_tokens=True)
 
             ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
             data_source = data_item.non_tensor_batch[self.reward_fn_key]
@@ -113,31 +119,38 @@ class CustomRewardManager(AbstractRewardManager):
             num_turns = data_item.non_tensor_batch.get("__num_turns__", None)
             extra_info["num_turns"] = num_turns
 
-            score = self.compute_score(
-                data_source=data_source,
-                solution_str=response_str,
-                ground_truth=ground_truth,
-                extra_info=extra_info,
-            )
-
-            if isinstance(score, dict):
-                reward = score["score"]
-                # Store the information including original reward
-                for key, value in score.items():
-                    reward_extra_info[key].append(value)
-            else:
+            if not m_flag and "m_rewards" in data.batch.keys():
+                score = data_item.batch["m_rewards"]
                 reward = score
-            
-            # calculate custom reward
-            length_penalty = valid_response_length / 4000
+            else:
+                score = self.compute_score(
+                    data_source=data_source,
+                    solution_str=response_str,
+                    ground_truth=ground_truth,
+                    extra_info=extra_info,
+                )
 
-            if is_train:
-                #valid_target_length = data_item.batch['target_attention_mask'].sum()
-                #item_logp = data_item.batch["m_log_probs"]
+                if isinstance(score, dict):
+                    reward = score["score"]
+                    # Store the information including original reward
+                    for key, value in score.items():
+                        reward_extra_info[key].append(value)
+                else:
+                    reward = score
             
-                #avg_logp = item_logp[:valid_target_length].mean()
-                if not m_flag:
-                    reward = reward - length_penalty
+            if i == 0 and is_train and m_flag:
+                print("[prompt]", prompt_str)
+                print("[m response]", response_str)
+                print("[ground_truth]", ground_truth)
+                if isinstance(score, dict):
+                    for key, value in score.items():
+                        print(f"[{key}]", value)
+                else:
+                    print("[score]", score)
+            
+            # apply length penalty
+            if is_train and not m_flag:
+                reward = reward - self.alpha * valid_response_length
             
             reward_tensor[i, valid_response_length - 1] = reward
 
@@ -147,7 +160,7 @@ class CustomRewardManager(AbstractRewardManager):
             if already_print_data_sources[data_source] < self.num_examine:
                 already_print_data_sources[data_source] += 1
                 print("[prompt]", prompt_str)
-                print("[response]", response_str)
+                print("[m response]", response_str)
                 print("[ground_truth]", ground_truth)
                 if isinstance(score, dict):
                     for key, value in score.items():
@@ -155,6 +168,9 @@ class CustomRewardManager(AbstractRewardManager):
                 else:
                     print("[score]", score)
 
+        #if is_train:
+        #    self.alpha *= 0.9
+        
         if return_dict:
             return {
                 "reward_tensor": reward_tensor,
