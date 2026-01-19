@@ -231,6 +231,47 @@ def decode_response(data: DataProto, tokenizer, key_name):
         response_list.append(response_str)
     return np.array(response_list, dtype=object)
 
+def prepare_m_prompt_only_inputs(data: DataProto, m_tokenizer, max_length=512):
+    from verl.utils.model import compute_position_id_with_mask
+    from verl.utils.torch_functional import postprocess_data
+
+    raw_questions = data.non_tensor_batch['raw_question']
+
+    inputs = [[{"role": "user", "content": q + " Let's think step by step and output the final answer within \\boxed{}."}] for q in raw_questions]
+    raw_inputs = [m_tokenizer.apply_chat_template(
+                message, add_generation_prompt=True, tokenize=False, enable_thinking=False) for message in inputs]
+
+    m_inputs = m_tokenizer(raw_inputs, return_tensors='pt', add_special_tokens=False, padding=True, padding_side="left")
+    input_ids = m_inputs['input_ids']
+    attention_mask = m_inputs['attention_mask']
+
+    # use tokenize_and_postprocess_data to get the input_ids and attention_mask
+    input_ids, attention_mask = postprocess_data(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        max_length=max_length,
+        pad_token_id=m_tokenizer.pad_token_id,
+        left_pad=True,
+        truncation='left'
+    )
+
+    position_ids = compute_position_id_with_mask(attention_mask)
+
+    meta_info = data.meta_info.copy()
+    meta_info["use_translator"] = True
+
+    m_batch = DataProto(
+        batch=data.batch.__class__({
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids
+        }, batch_size=data.batch.batch_size),
+        non_tensor_batch=data.non_tensor_batch.copy(),
+        meta_info=meta_info
+    )
+
+    return m_batch
+
 def prepare_m_inputs(data: DataProto, m_tokenizer, max_length=4000):
     from verl.utils.model import compute_position_id_with_mask
     from verl.utils.torch_functional import postprocess_data
@@ -238,10 +279,12 @@ def prepare_m_inputs(data: DataProto, m_tokenizer, max_length=4000):
     raw_questions = data.non_tensor_batch['raw_question']
     raw_M_responses = data.non_tensor_batch['raw_M_responses']
     
-    inputs = [[{"role": "user", "content": "You are given a math problem and a high-level strategy. Your task is to solve the problem and output the final answer within \\boxed{}.\nMath problem:\n" + q + "\nHigh-level strategy:\n" + response + "\nSolution:"}] for q, response in zip(raw_questions, raw_M_responses)]
-    #inputs = [q + " Let's think step by step and output the final answer within \\boxed{}." for q, response in zip(raw_questions, raw_M_responses)]
-    raw_inputs = [m_tokenizer.apply_chat_template(
-                message, add_generation_prompt=True, tokenize=False, enable_thinking=False) for message in inputs]
+    #inputs = [[{"role": "user", "content": "You are given a math problem and a high-level strategy. Your task is to solve the problem and output the final answer within \\boxed{}.\nMath problem:\n" + q + "\nHigh-level strategy:\n" + response + "\nSolution:"}] for q, response in zip(raw_questions, raw_M_responses)]
+    #inputs = [[{"role": "user", "content": q + " Let's think step by step and output the final answer within \\boxed{}.\n<think>\n" + response + "\n</think>"}] for q, response in zip(raw_questions, raw_M_responses)]
+    
+    raw_inputs = ["user\n" + q + " Let's think step by step and output the final answer within \\boxed{}.\nassistant\n<think>\n" + response + "\n</think>" for q, response in zip(raw_questions, raw_M_responses)]
+    #raw_inputs = [m_tokenizer.apply_chat_template(
+    #            message, add_generation_prompt=True, tokenize=False, enable_thinking=False) for message in inputs]
     
     m_inputs = m_tokenizer(raw_inputs, return_tensors='pt', add_special_tokens=False, padding=True, padding_side="left")
     input_ids = m_inputs['input_ids']
@@ -781,6 +824,11 @@ class RayPPOTrainer:
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
+            # Ensure response mask exists and record response lengths for metrics
+            if "response_mask" not in test_batch.batch.keys():
+                test_batch.batch["response_mask"] = compute_response_mask(test_batch)
+            response_lengths = test_batch.batch["response_mask"].sum(dim=1).cpu().tolist()
+            reward_extra_infos_dict["M_response_length"].extend(response_lengths)
             
             # Decode M response
             test_batch.non_tensor_batch["raw_M_responses"] = decode_response(test_batch, self.tokenizer, key_name="responses") # prompt + M_response
@@ -896,6 +944,15 @@ class RayPPOTrainer:
                         metric_sec = "val-aux"
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
+            # Also log mean response length as a core metric if available
+            if "M_response_length" in var2metric2val:
+                m_resp_metrics = var2metric2val["M_response_length"]
+                # Prefer the mean over the largest sample size
+                mean_keys = [k for k in m_resp_metrics.keys() if k.startswith("mean@")]
+                if mean_keys:
+                    # choose key with largest N (parsed after '@')
+                    best_key = max(mean_keys, key=lambda k: int(k.split("@")[-1]))
+                    metric_dict[f"val-core/{data_source}/M_response_length"] = m_resp_metrics[best_key]
 
         if len(sample_turns) > 0:
             sample_turns = np.concatenate(sample_turns)
@@ -1380,9 +1437,26 @@ class RayPPOTrainer:
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
                     #print(f"batch batch keys: {batch.batch.keys()}")
                     # construct the new prompt for translator translation
-                    # but for now, we just use the same prompt for translator translation, just for testing the code
-                    # Translator Generation, we only test generate_sequences function, not other translator related stuff
+                    # Translator Generation, including prompt-only baseline and guided run
                     if self.use_translator:
+                        # Baseline translator run conditioned only on the original prompt (for r_m)
+                        m_prompt_batch = prepare_m_prompt_only_inputs(batch, self.m_tokenizer)
+                        with marked_timer("translator_prompt_gen", timing_raw, color="gold"):
+                            m_prompt_gen_batch = self._get_gen_batch(m_prompt_batch)
+                            m_prompt_gen_batch.meta_info["global_steps"] = self.global_steps
+                            m_prompt_gen_batch = m_prompt_gen_batch.repeat(repeat_times=self.config.translator.rollout.n, interleave=True)
+
+                            m_prompt_gen_output = self.translator_wg.generate_sequences(m_prompt_gen_batch)
+                            if "timing" in m_prompt_gen_output.meta_info:
+                                timing_raw.update({f"translator_prompt/{k}": v for k, v in m_prompt_gen_output.meta_info["timing"].items()})
+                            m_prompt_gen_output.meta_info.pop("timing", None)
+                            m_prompt_batch = m_prompt_batch.repeat(repeat_times=self.config.translator.rollout.n, interleave=True)
+                            m_prompt_batch = m_prompt_batch.union(m_prompt_gen_output)
+
+                        if "response_mask" not in m_prompt_batch.batch.keys():
+                            m_prompt_batch.batch["response_mask"] = compute_response_mask(m_prompt_batch)
+
+                        # Guided translator run conditioned on actor output (for r_Mm)
                         m_batch = prepare_m_inputs(batch, self.m_tokenizer)
                         with marked_timer("translator_gen", timing_raw, color="orange"):
                             m_gen_batch = self._get_gen_batch(m_batch)
@@ -1415,6 +1489,26 @@ class RayPPOTrainer:
                     
                     with marked_timer("reward", timing_raw, color="yellow"):
                         if self.use_translator:
+                            translator_n = self.config.translator.rollout.n
+                            actor_bs = batch.batch["prompts"].shape[0]
+
+                            # compute reward on prompt-only translator batch (r_m)
+                            if self.use_rm:
+                                prompt_reward_tensor = self.rm_wg.compute_rm_score(m_prompt_batch)
+                                m_prompt_batch = m_prompt_batch.union(prompt_reward_tensor)
+
+                            prompt_reward_tensor, _ = compute_reward(m_prompt_batch, self.reward_fn)
+                            m_prompt_batch.batch["token_level_scores"] = prompt_reward_tensor
+
+                            prompt_rewards = prompt_reward_tensor.sum(dim=-1)  # shape: [batch_size * n]
+                            expected_prompt = actor_bs * translator_n
+                            if prompt_rewards.shape[0] != expected_prompt:
+                                raise ValueError(
+                                    f"prompt translator rewards shape mismatch: {prompt_rewards.shape[0]=}, expected {expected_prompt=}"
+                                )
+                            prompt_rewards = prompt_rewards.view(actor_bs, translator_n).mean(dim=1)
+                            batch.batch["m_prompt_rewards"] = prompt_rewards
+
                             # compute reward on m_batch
                             if self.use_rm:
                                 reward_tensor = self.rm_wg.compute_rm_score(m_batch)
@@ -1429,8 +1523,6 @@ class RayPPOTrainer:
                             
                             # Aggregate translator rewards back to the actor prompts.
                             translator_rewards = reward_tensor.sum(dim=-1)  # shape: [batch_size * n]
-                            translator_n = self.config.translator.rollout.n
-                            actor_bs = batch.batch["prompts"].shape[0]
                             expected = actor_bs * translator_n
                             if translator_rewards.shape[0] != expected:
                                 raise ValueError(
@@ -1440,6 +1532,19 @@ class RayPPOTrainer:
 
                             # append mean translator reward to batch for the corresponding actor response
                             batch.batch["m_rewards"] = translator_rewards
+
+                            # key metrics: r_Mm, r_m, response length, lambda
+                            r_mm_mean = translator_rewards.mean().detach().item()
+                            r_m_mean = prompt_rewards.mean().detach().item()
+                            resp_len_mean = batch.batch["response_mask"].sum(dim=1).float().mean().detach().item()
+                            lambda_val = getattr(self.reward_fn, "lambda_factor", None)
+                            metrics.update({
+                                "key_metrics/r_Mm": r_mm_mean,
+                                "key_metrics/r_m": r_m_mean,
+                                "key_metrics/response_length": resp_len_mean,
+                            })
+                            if lambda_val is not None:
+                                metrics["key_metrics/lambda"] = float(lambda_val)
 
                         # compute reward model score
                         if self.use_rm:
@@ -1513,12 +1618,16 @@ class RayPPOTrainer:
                             )
                             metrics.update(kl_metrics)
                             if self.use_translator:
-                                m_batch, m_kl_metrics = apply_kl_penalty(
-                                    m_batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
-                                )
-                                # Rename metrics to distinguish them from actor metrics
-                                m_kl_metrics = {k.replace("actor/", "translator/"): v for k, v in m_kl_metrics.items()}
-                                metrics.update(m_kl_metrics)
+                                if "ref_log_prob" in m_batch.batch and "old_log_probs" in m_batch.batch and False:
+                                    m_batch, m_kl_metrics = apply_kl_penalty(
+                                        m_batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                                    )
+                                    # Rename metrics to distinguish them from actor metrics
+                                    m_kl_metrics = {k.replace("actor/", "translator/"): v for k, v in m_kl_metrics.items()}
+                                    metrics.update(m_kl_metrics)
+                                else:
+                                    # No reference policy for translator; skip KL and just pass scores through.
+                                    m_batch.batch["token_level_rewards"] = m_batch.batch["token_level_scores"]
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
                             if self.use_translator:
@@ -1564,7 +1673,7 @@ class RayPPOTrainer:
                         metrics.update(critic_output_metrics)
 
                     # update m
-                    if self.use_translator:
+                    if self.use_translator and False:
                         with marked_timer("translator_update", timing_raw, color="orange"):
                             translator_output = self.translator_wg.update_actor(m_batch)
                             
@@ -1573,7 +1682,7 @@ class RayPPOTrainer:
                         metrics.update(translator_metrics)
 
                     # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps and False:
+                    if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable

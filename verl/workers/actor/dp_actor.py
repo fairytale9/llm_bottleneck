@@ -454,8 +454,8 @@ class DataParallelPPOActor(BasePPOActor):
                         policy_loss = pg_loss
 
                     if self.config.use_kl_loss:
-                        #ref_log_prob = model_inputs["ref_log_prob"]
-                        ref_log_prob = model_inputs["old_log_probs"]
+                        ref_log_prob = model_inputs["ref_log_prob"]
+                        #ref_log_prob = model_inputs["old_log_probs"]
                         # compute kl loss
                         kld = kl_penalty(
                             logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type

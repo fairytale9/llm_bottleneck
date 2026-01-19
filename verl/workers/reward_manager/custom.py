@@ -15,12 +15,20 @@
 """
 Custom Reward Manager for LLM Bottleneck Training.
 
-This reward manager implements the custom reward formula:
-reward = 1/(length of the response) - logp of the response
+Implements the reward for the actor as:
 
-Where:
-- response_length: The number of tokens in the generated response
-- logp: Log probability computed by the translator worker and stored in batch.batch["m_logp"]
+    reward_actor = r_Mm - r_m - lambda * L / B
+
+where:
+    - r_Mm: reward from the translator conditioned on the actor output
+    - r_m:  reward from the translator conditioned only on the original prompt
+    - L:    actor response length (valid tokens)
+    - B:    predefined bound (1000)
+    - lambda: adaptive factor in [0, 1], updated after every batch:
+        lambda <- clip_0_1(lambda + eta * (E[L]/B - 1)), eta=0.01
+
+The translator reward r_m is expected to be pre-computed and stored in
+`batch["m_prompt_rewards"]`, while r_Mm is stored in `batch["m_rewards"]`.
 """
 
 from collections import defaultdict
@@ -38,10 +46,8 @@ from verl.workers.reward_manager.abstract import AbstractRewardManager
 @register("custom")
 class CustomRewardManager(AbstractRewardManager):
     """
-    Custom Reward Manager that implements the formula: reward = 1/(response_length) - logp
-    
-    This reward manager can access batch data directly and compute rewards based on
-    log probabilities stored in batch.batch["m_logp"] by the TranslatorWorker.
+    Custom Reward Manager that implements the actor reward with translator
+    baselines and adaptive length penalty.
     """
     
     def __init__(self, tokenizer, m_tokenizer, num_examine, compute_score=None, reward_fn_key="data_source"):
@@ -61,7 +67,10 @@ class CustomRewardManager(AbstractRewardManager):
         self.compute_score = compute_score or default_compute_score
         self.reward_fn_key = reward_fn_key  # Store the key for accessing the data source
 
-        self.alpha = 1 / 2000 # length penalty
+        # Adaptive length penalty parameters
+        self.length_bound = 1000.0
+        self.lambda_factor = 0.0
+        self.lambda_eta = 0.01
     
     def __call__(self, data: DataProto, return_dict: bool = False, is_train: bool = True) -> torch.Tensor | dict[str, Any]:
         """We will expand this function gradually based on the available datasets"""
@@ -95,6 +104,7 @@ class CustomRewardManager(AbstractRewardManager):
         reward_extra_info = defaultdict(list)
 
         already_print_data_sources = {}
+        response_lengths: list[float] = []
 
         for i in range(len(data)):
             data_item = data[i]  # DataProtoItem
@@ -120,8 +130,15 @@ class CustomRewardManager(AbstractRewardManager):
             extra_info["num_turns"] = num_turns
 
             if not m_flag and "m_rewards" in data.batch.keys():
-                score = data_item.batch["m_rewards"]
-                reward = score
+                # r_Mm: translator reward conditioned on actor output
+                r_mm = data_item.batch["m_rewards"]
+                # r_m: translator reward conditioned only on prompt
+                r_m = data_item.batch.get("m_prompt_rewards", 0.0)
+
+                r_mm_val = r_mm.item() if isinstance(r_mm, torch.Tensor) else float(r_mm)
+                r_m_val = r_m.item() if isinstance(r_m, torch.Tensor) else float(r_m)
+
+                reward = r_mm_val - r_m_val
             else:
                 score = self.compute_score(
                     data_source=data_source,
@@ -148,9 +165,11 @@ class CustomRewardManager(AbstractRewardManager):
                 else:
                     print("[score]", score)
             
-            # apply length penalty
+            # apply adaptive length penalty
             if is_train and not m_flag:
-                reward = reward - self.alpha * valid_response_length
+                penalty = self.lambda_factor * (valid_response_length / self.length_bound)
+                reward = reward - penalty
+                response_lengths.append(float(valid_response_length))
             
             reward_tensor[i, valid_response_length - 1] = reward
 
@@ -168,8 +187,11 @@ class CustomRewardManager(AbstractRewardManager):
                 else:
                     print("[score]", score)
 
-        #if is_train:
-        #    self.alpha *= 0.9
+        # Update lambda using batch mean length
+        if is_train and response_lengths:
+            mean_len = sum(response_lengths) / len(response_lengths)
+            self.lambda_factor += self.lambda_eta * (mean_len / self.length_bound - 1.0)
+            self.lambda_factor = max(0.0, min(1.0, self.lambda_factor))
         
         if return_dict:
             return {
