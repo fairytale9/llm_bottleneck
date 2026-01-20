@@ -836,7 +836,7 @@ class RayPPOTrainer:
             
             if self.use_translator:
                 # generate m response
-                m_test_batch = prepare_m_inputs(test_batch, self.m_tokenizer)
+                m_test_batch = prepare_m_inputs(test_batch, self.m_tokenizer, self.config.translator.rollout.prompt_length)
                 m_test_gen_batch = self._get_gen_batch(m_test_batch)
                 m_test_gen_batch.meta_info.update({
                     "eos_token_id": self.m_tokenizer.eos_token_id,
@@ -1440,7 +1440,7 @@ class RayPPOTrainer:
                     # Translator Generation, including prompt-only baseline and guided run
                     if self.use_translator:
                         # Baseline translator run conditioned only on the original prompt (for r_m)
-                        m_prompt_batch = prepare_m_prompt_only_inputs(batch, self.m_tokenizer)
+                        m_prompt_batch = prepare_m_prompt_only_inputs(batch, self.m_tokenizer, self.config.data.max_prompt_length)
                         with marked_timer("translator_prompt_gen", timing_raw, color="gold"):
                             m_prompt_gen_batch = self._get_gen_batch(m_prompt_batch)
                             m_prompt_gen_batch.meta_info["global_steps"] = self.global_steps
@@ -1457,7 +1457,7 @@ class RayPPOTrainer:
                             m_prompt_batch.batch["response_mask"] = compute_response_mask(m_prompt_batch)
 
                         # Guided translator run conditioned on actor output (for r_Mm)
-                        m_batch = prepare_m_inputs(batch, self.m_tokenizer)
+                        m_batch = prepare_m_inputs(batch, self.m_tokenizer, self.config.translator.rollout.prompt_length)
                         with marked_timer("translator_gen", timing_raw, color="orange"):
                             m_gen_batch = self._get_gen_batch(m_batch)
                             m_gen_batch.meta_info["global_steps"] = self.global_steps
