@@ -12,14 +12,14 @@ set -x
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files=$HOME/data/math/train.parquet \
-    data.val_files=$HOME/data/aime24/test.parquet \
+    data.val_files=$HOME/data/aime2024/test.parquet \
     data.train_batch_size=128 \
     data.val_batch_size=128 \
     data.max_prompt_length=512 \
-    data.max_response_length=16384 \
+    data.max_response_length=8192 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
-    actor_rollout_ref.model.path="Qwen/Qwen3-4B" \
+    actor_rollout_ref.model.path="Qwen/Qwen3-4B-Thinking-2507" \
     actor_rollout_ref.model.lora_rank=0 \
     actor_rollout_ref.model.lora_alpha=16 \
     actor_rollout_ref.actor.optim.lr=1e-6 \
@@ -43,6 +43,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     +translator.enable=True \
     translator.model.path="Qwen/Qwen3-0.6B" \
+    translator.model.lora_rank=0 \
+    translator.model.lora_alpha=16 \
     translator.model.use_remove_padding=False \
     translator.model.enable_gradient_checkpointing=False \
     translator.actor.optim.lr=1e-5 \
@@ -55,7 +57,7 @@ python3 -m verl.trainer.main_ppo \
     translator.actor.fsdp_config.param_offload=False \
     translator.actor.fsdp_config.optimizer_offload=False \
     translator.rollout.log_prob_micro_batch_size_per_gpu=8 \
-    translator.rollout.prompt_length=16896 \
+    translator.rollout.prompt_length=30000 \
     translator.rollout.response_length=2048 \
     translator.rollout.tensor_model_parallel_size=1 \
     translator.rollout.name=vllm \
@@ -69,9 +71,9 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
     trainer.project_name='eval-aime2024' \
-    trainer.experiment_name='qwen3-4b-0.6b-Lout16384-2048' \
-    trainer.n_gpus_per_node=2 \
-    trainer.translator_n_gpus_per_node=2 \
+    trainer.experiment_name='eval_Mm_LoutM28000m2048-M-qwen3-4b-thinking' \
+    trainer.n_gpus_per_node=1 \
+    trainer.translator_n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.save_freq=50 \
     trainer.test_freq=10 \
