@@ -1317,46 +1317,10 @@ class RayPPOTrainer:
         )
         next_step_profile = False
 
-        #_train_M = True
+
         for epoch in range(self.config.trainer.total_epochs):
-            # at the beginning of each epoch, train m on the whole dataset
-            #if self.use_translator:
-            #    for batch_dict in self.train_dataloader:
-            #        batch: DataProto = DataProto.from_single_dict(batch_dict)
-                    # add uid to batch
-            #        batch.non_tensor_batch["uid"] = np.array(
-            #            [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
-            #        )
-            #        gen_batch = self._get_gen_batch(batch)
-                    # pass global_steps to trace
-                    #gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
 
-            #        if not self.async_rollout_mode:
-            #            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
-            #        else:
-            #            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
-                    
-            #        gen_batch_output.meta_info.pop("timing", None)
-                    # repeat to align with repeated responses in rollout
-                    #batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-            #        batch = batch.union(gen_batch_output)
-
-                    # decode responses
-            #        if "raw_responses" not in batch.batch.keys():
-            #            batch.non_tensor_batch["raw_responses"] = decode_response(batch, self.tokenizer)
-
-            #        if "response_mask" not in batch.batch.keys():
-            #            batch.batch["response_mask"] = compute_response_mask(batch)
-                    
-            #        batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-
-            #        translator_output = self.translator_wg.update_translator(batch)
-                    #translator_metrics = reduce_metrics(translator_output.meta_info["metrics"])
-                    #metrics.update(translator_metrics)
             for batch_dict in self.train_dataloader:
-                #if self.global_steps > 20:
-                #    _train_M = False
-
                 metrics = {}
                 timing_raw = {}
 
@@ -1416,15 +1380,13 @@ class RayPPOTrainer:
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
-                    # decode responses
-                    #if "raw_M_responses" not in batch.batch.keys():
-                    batch.non_tensor_batch["raw_M_responses"] = decode_response(batch, self.tokenizer, key_name="responses")
-                    
-                    #if "raw_prompts" not in batch.batch.keys():
-                    #    batch.non_tensor_batch["raw_prompts"] = decode_response(batch, self.tokenizer, key_name="prompts")
-
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+
+                    # <<<<<<< decode M responses >>>>>>>>
+                    batch.non_tensor_batch["raw_M_responses"] = decode_response(batch, self.tokenizer, key_name="responses")
+
+
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1435,9 +1397,8 @@ class RayPPOTrainer:
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-                    #print(f"batch batch keys: {batch.batch.keys()}")
-                    # construct the new prompt for translator translation
-                    # Translator Generation, including prompt-only baseline and guided run
+                    
+                    # <<<<<<< finish M batch, generate m batch >>>>>>>>
                     if self.use_translator:
                         # Baseline translator run conditioned only on the original prompt (for r_m)
                         m_prompt_batch = prepare_m_prompt_only_inputs(batch, self.m_tokenizer, self.config.data.max_prompt_length)
@@ -1469,20 +1430,6 @@ class RayPPOTrainer:
                             m_gen_batch_output.meta_info.pop("timing", None)
                             m_batch = m_batch.repeat(repeat_times=self.config.translator.rollout.n, interleave=True)
                             m_batch = m_batch.union(m_gen_batch_output)
-                            #batch.batch['m_responses'] = m_batch.batch['responses'] # for reward computation
-
-                            # Prepare for log prob computation
-                            #batch.batch["target_ids"] = batch.batch["m_responses"]
-                            #batch.batch["target_attention_mask"] = (batch.batch["m_responses"] != self.tokenizer.pad_token_id).int()
-
-                        #with marked_timer("translator_compute_log_prob", timing_raw, color="green"):
-                        #    # Compute log probs of the generated responses
-                        #    m_batch = self.translator_wg.compute_log_prob(batch, calculate_entropy=True)
-                        #    batch.batch["m_old_log_probs"] = m_batch.batch["log_probs"] # Store for PPO
-                        #    if "entropys" in m_batch.batch:
-                        #        batch.batch["m_entropys"] = m_batch.batch["entropys"]
-                        #    m_logps = agg_loss(loss_mat=batch.batch["m_old_log_probs"], loss_mask=batch.batch["target_attention_mask"], loss_agg_mode="seq-mean-token-mean")
-                        #    metrics.update({"translator/logp": m_logps.detach().item()})
 
                         if "response_mask" not in m_batch.batch.keys():
                             m_batch.batch["response_mask"] = compute_response_mask(m_batch)
@@ -1618,6 +1565,7 @@ class RayPPOTrainer:
                             )
                             metrics.update(kl_metrics)
                             if self.use_translator:
+                                # we don't apply kl penalty to translator
                                 if "ref_log_prob" in m_batch.batch and "old_log_probs" in m_batch.batch and False:
                                     m_batch, m_kl_metrics = apply_kl_penalty(
                                         m_batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
@@ -1673,7 +1621,7 @@ class RayPPOTrainer:
                         metrics.update(critic_output_metrics)
 
                     # update m
-                    if self.use_translator and False:
+                    if self.use_translator:
                         with marked_timer("translator_update", timing_raw, color="orange"):
                             translator_output = self.translator_wg.update_actor(m_batch)
                             

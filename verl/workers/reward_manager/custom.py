@@ -98,8 +98,6 @@ class CustomRewardManager(AbstractRewardManager):
             m_flag = True
             _tokenizer = self.m_tokenizer
 
-        #print(f"m_flag: {m_flag}")
-
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
         reward_extra_info = defaultdict(list)
 
