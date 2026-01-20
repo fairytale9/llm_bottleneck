@@ -31,19 +31,19 @@ def extract_solution(solution_str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--local_dir", default="~/data/math")
+    parser.add_argument("--local_dir", default="~/data/limo")
     parser.add_argument("--hdfs_dir", default=None)
 
     args = parser.parse_args()
 
     # 'lighteval/MATH' is no longer available on huggingface.
     # Use mirror repo: DigitalLearningGmbH/MATH-lighteval
-    data_source = "DigitalLearningGmbH/MATH-lighteval"
+    data_source = "GAIR/LIMO-v2"
     print(f"Loading the {data_source} dataset from huggingface...", flush=True)
-    dataset = datasets.load_dataset("HuggingFaceH4/MATH-500", trust_remote_code=True)
+    dataset = datasets.load_dataset(data_source, trust_remote_code=True)
 
-    #train_dataset = dataset["train"]
-    test_dataset = dataset["test"]
+    train_dataset = dataset["train"]
+    #test_dataset = dataset["test"]
 
     #instruction_following = "Let's produce a high-level solution strategy that explains *how* to solve the problem, not *the solution itself*."
     instruction_following = "Let's think step by step and output the final answer within \\boxed{}."
@@ -51,7 +51,7 @@ if __name__ == "__main__":
     # add a row to each data item that represents a unique id
     def make_map_fn(split):
         def process_fn(example, idx):
-            question = example.pop("problem")
+            question = example.pop("question")
 
             prompt = question + " " + instruction_following
 
@@ -69,21 +69,21 @@ if __name__ == "__main__":
 
         return process_fn
 
-    #train_dataset = train_dataset.map(function=make_map_fn("train"), with_indices=True)
-    test_dataset = test_dataset.map(function=make_map_fn("test"), with_indices=True)
+    train_dataset = train_dataset.map(function=make_map_fn("train"), with_indices=True)
+    #test_dataset = test_dataset.map(function=make_map_fn("test"), with_indices=True)
 
     local_dir = os.path.expanduser(args.local_dir)
     hdfs_dir = args.hdfs_dir
 
-    #train_dataset.to_parquet(os.path.join(local_dir, "train.parquet"))
-    test_dataset.to_parquet(os.path.join(local_dir, "test.parquet"))
+    train_dataset.to_parquet(os.path.join(local_dir, "train.parquet"))
+    #test_dataset.to_parquet(os.path.join(local_dir, "test.parquet"))
     # Save one example as JSON for reference
-    #example = train_dataset[0]
-    #with open(os.path.join(local_dir, "train_example.json"), "w") as f:
-    #    json.dump(example, f, indent=2)
-    example = test_dataset[0]
-    with open(os.path.join(local_dir, "test_example.json"), "w") as f:
+    example = train_dataset[0]
+    with open(os.path.join(local_dir, "train_example.json"), "w") as f:
         json.dump(example, f, indent=2)
+    #example = test_dataset[0]
+    #with open(os.path.join(local_dir, "test_example.json"), "w") as f:
+    #    json.dump(example, f, indent=2)
     if hdfs_dir is not None:
         makedirs(hdfs_dir)
 
