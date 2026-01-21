@@ -1,26 +1,46 @@
 set -x
 
-#translator.ppo_mini_batch_size=256 \
-#translator.ppo_micro_batch_size_per_gpu=32 \
+deepscaler_train_path=$HOME/data/deepscaler/train.parquet
+dapo_train_path=$HOME/data/dapo17k/train.parquet
+limo_train_path=$HOME/data/limo/train.parquet
+# specify configs
+math_test_path=$HOME/data/math/test.parquet
+aime_2024_test_path=$HOME/data/aime2024/test.parquet
+gpqa_test_path=$HOME/data/gpqa/test.parquet
 
-# if use lora
-#actor_rollout_ref.rollout.load_format=safetensors \
-#actor_rollout_ref.rollout.layered_summon=True \
-#"deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
-export RAY_num_server_call_thread=8
+test_files="['$deepscaler_train_path']"
 
+M_model_path="Qwen/Qwen3-4B"
+M_prompt_length=1024
+M_response_length=16384
+
+m_enable=False
+m_model_path="/projectnb/noc-lab/ylchen/llm_bottleneck/checkpoints/rl-M-m/qwen3-4b-0.6b-Lout8096-2048-deepscaler/global_step_100/hf_translator"
+m_response_length=2048
+
+project_name="eval-deepscaler"
+experiment_name="qwen3-4b-Lout-${M_response_length}-${m_response_length}"
+
+
+if [[ "${m_enable,,}" == "true" ]]; then
+    translator_n_gpus_per_node=2
+    trainer_n_gpus_per_node=2
+else
+    translator_n_gpus_per_node=0
+    trainer_n_gpus_per_node=4
+fi
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files=$HOME/data/limo/train.parquet \
-    data.val_files=$HOME/data/math/test.parquet \
+    data.val_files="$test_files" \
     data.train_batch_size=128 \
     data.val_batch_size=128 \
-    data.max_prompt_length=512 \
-    data.max_response_length=10000 \
+    data.max_prompt_length=$M_prompt_length \
+    data.max_response_length=$M_response_length \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
-    actor_rollout_ref.model.path="Qwen/Qwen3-4B" \
+    actor_rollout_ref.model.path=$M_model_path \
     actor_rollout_ref.model.lora_rank=0 \
     actor_rollout_ref.model.lora_alpha=16 \
     actor_rollout_ref.actor.optim.lr=1e-6 \
@@ -39,13 +59,11 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     actor_rollout_ref.rollout.n=4 \
-    actor_rollout_ref.rollout.max_num_batched_tokens=33280 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=20000 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
-    +translator.enable=False \
-    translator.model.path="Qwen/Qwen3-0.6B" \
-    translator.model.lora_rank=0 \
-    translator.model.lora_alpha=16 \
+    +translator.enable=$m_enable \
+    translator.model.path=$m_model_path \
     translator.model.use_remove_padding=False \
     translator.model.enable_gradient_checkpointing=False \
     translator.actor.optim.lr=1e-5 \
@@ -58,8 +76,8 @@ python3 -m verl.trainer.main_ppo \
     translator.actor.fsdp_config.param_offload=False \
     translator.actor.fsdp_config.optimizer_offload=False \
     translator.rollout.log_prob_micro_batch_size_per_gpu=8 \
-    translator.rollout.prompt_length=4608 \
-    translator.rollout.response_length=2048 \
+    translator.rollout.prompt_length=$(($M_prompt_length+$M_response_length)) \
+    translator.rollout.response_length=$m_response_length \
     translator.rollout.tensor_model_parallel_size=1 \
     translator.rollout.name=vllm \
     translator.rollout.gpu_memory_utilization=0.6 \
@@ -71,10 +89,10 @@ python3 -m verl.trainer.main_ppo \
     trainer.val_only=True \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
-    trainer.project_name='eval-only' \
-    trainer.experiment_name='real-math500_qwen3-4b-Lout10000' \
-    trainer.n_gpus_per_node=2 \
-    trainer.translator_n_gpus_per_node=0 \
+    trainer.project_name=$project_name \
+    trainer.experiment_name=$experiment_name \
+    trainer.n_gpus_per_node=$trainer_n_gpus_per_node \
+    trainer.translator_n_gpus_per_node=$translator_n_gpus_per_node  \
     trainer.nnodes=1 \
     trainer.save_freq=50 \
     trainer.test_freq=10 \

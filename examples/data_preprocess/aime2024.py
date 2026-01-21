@@ -34,15 +34,15 @@ if __name__ == "__main__":
     data_source = "Maxwell-Jia/AIME_2024"
     test_dataset = datasets.load_dataset(data_source, split="train")
     
-    #instruction_following = "Let's produce a high-level solution strategy that explains *how* to solve the problem, not *the solution itself*."
-    instruction_following = "Let's think step by step and output the final answer within \\boxed{}."
+    instruction_following = "Solve the following math problem step by step. The last line of your response should be of the form Answer: $Answer (without quotes) where $Answer is the answer to the problem.\n\n"
+    #instruction_following = "Let's think step by step and output the final answer within \\boxed{}."
 
     # add a row to each data item that represents a unique id
     def make_map_fn(split):
         def process_fn(example, idx):
             question = example.pop("Problem")
 
-            prompt = question + " " + instruction_following
+            prompt = instruction_following + question
 
             answer = example.pop("Solution")
             solution = str(example.pop("Answer"))
@@ -53,7 +53,7 @@ if __name__ == "__main__":
                 "ability": "math",
                 "reward_model": {"style": "rule", "ground_truth": solution},
                 "extra_info": {"split": split, "index": idx, "answer": answer, "question": question},
-                "raw_question": question,
+                "raw_question": prompt,
             }
             return data
 

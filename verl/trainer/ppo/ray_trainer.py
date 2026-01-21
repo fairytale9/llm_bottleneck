@@ -231,13 +231,16 @@ def decode_response(data: DataProto, tokenizer, key_name):
         response_list.append(response_str)
     return np.array(response_list, dtype=object)
 
+#TODO: improve the prompt logic
 def prepare_m_prompt_only_inputs(data: DataProto, m_tokenizer, max_length=512):
     from verl.utils.model import compute_position_id_with_mask
     from verl.utils.torch_functional import postprocess_data
 
+    instruction = "Solve the following math problem step by step. The last line of your response should be of the form Answer: $Answer (without quotes) where $Answer is the answer to the problem.\n\n"
+    
     raw_questions = data.non_tensor_batch['raw_question']
 
-    inputs = [[{"role": "user", "content": q + " Let's think step by step and output the final answer within \\boxed{}."}] for q in raw_questions]
+    inputs = [[{"role": "user", "content": q}] for q in raw_questions]
     raw_inputs = [m_tokenizer.apply_chat_template(
                 message, add_generation_prompt=True, tokenize=False, enable_thinking=False) for message in inputs]
 
@@ -258,7 +261,7 @@ def prepare_m_prompt_only_inputs(data: DataProto, m_tokenizer, max_length=512):
     position_ids = compute_position_id_with_mask(attention_mask)
 
     meta_info = data.meta_info.copy()
-    meta_info["use_translator"] = True
+    #meta_info["use_translator"] = True
 
     m_batch = DataProto(
         batch=data.batch.__class__({
@@ -276,13 +279,15 @@ def prepare_m_inputs(data: DataProto, m_tokenizer, max_length=4000):
     from verl.utils.model import compute_position_id_with_mask
     from verl.utils.torch_functional import postprocess_data
 
+    instruction = "Solve the following math problem step by step. The last line of your response should be of the form Answer: $Answer (without quotes) where $Answer is the answer to the problem.\n\n"
+    
     raw_questions = data.non_tensor_batch['raw_question']
     raw_M_responses = data.non_tensor_batch['raw_M_responses']
     
     #inputs = [[{"role": "user", "content": "You are given a math problem and a high-level strategy. Your task is to solve the problem and output the final answer within \\boxed{}.\nMath problem:\n" + q + "\nHigh-level strategy:\n" + response + "\nSolution:"}] for q, response in zip(raw_questions, raw_M_responses)]
     #inputs = [[{"role": "user", "content": q + " Let's think step by step and output the final answer within \\boxed{}.\n<think>\n" + response + "\n</think>"}] for q, response in zip(raw_questions, raw_M_responses)]
     
-    raw_inputs = ["user\n" + q + " Let's think step by step and output the final answer within \\boxed{}.\nassistant\n<think>\n" + response + "\n</think>" for q, response in zip(raw_questions, raw_M_responses)]
+    raw_inputs = ["user\n" + q + "\nassistant\n<think>\n" + response + "\n</think>" for q, response in zip(raw_questions, raw_M_responses)]
     #raw_inputs = [m_tokenizer.apply_chat_template(
     #            message, add_generation_prompt=True, tokenize=False, enable_thinking=False) for message in inputs]
     
@@ -1386,6 +1391,11 @@ class RayPPOTrainer:
                     # <<<<<<< decode M responses >>>>>>>>
                     batch.non_tensor_batch["raw_M_responses"] = decode_response(batch, self.tokenizer, key_name="responses")
 
+                    # Indicate whether translator was used so the reward fn can pick the correct tokenizer.
+                    if getattr(batch, "meta_info", None) is None:
+                        batch.meta_info = {}
+                    batch.meta_info["use_translator"] = self.use_translator
+
 
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
@@ -1484,14 +1494,15 @@ class RayPPOTrainer:
                             r_mm_mean = translator_rewards.mean().detach().item()
                             r_m_mean = prompt_rewards.mean().detach().item()
                             resp_len_mean = batch.batch["response_mask"].sum(dim=1).float().mean().detach().item()
-                            lambda_val = getattr(self.reward_fn, "lambda_factor", None)
                             metrics.update({
                                 "key_metrics/r_Mm": r_mm_mean,
                                 "key_metrics/r_m": r_m_mean,
                                 "key_metrics/response_length": resp_len_mean,
                             })
-                            if lambda_val is not None:
-                                metrics["key_metrics/lambda"] = float(lambda_val)
+                        
+                        lambda_val = getattr(self.reward_fn, "lambda_factor", None)
+                        if lambda_val is not None:
+                            metrics["key_metrics/lambda"] = float(lambda_val)
 
                         # compute reward model score
                         if self.use_rm:
@@ -1621,7 +1632,7 @@ class RayPPOTrainer:
                         metrics.update(critic_output_metrics)
 
                     # update m
-                    if self.use_translator:
+                    if self.use_translator and self.config.translator.train:
                         with marked_timer("translator_update", timing_raw, color="orange"):
                             translator_output = self.translator_wg.update_actor(m_batch)
                             

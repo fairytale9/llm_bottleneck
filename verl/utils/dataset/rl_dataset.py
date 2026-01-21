@@ -276,14 +276,14 @@ class RLHFDataset(Dataset):
             attention_mask = model_inputs.pop("attention_mask")
 
             # process response
-            response = row_dict['extra_info']['answer'] # raw response
-            if response:
-                model_inputs_for_response = self.m_tokenizer(response, return_tensors="pt")
-                input_ids_for_response = model_inputs_for_response.pop("input_ids")
-                attention_mask_for_response = model_inputs_for_response.pop("attention_mask")
-            else:
-                input_ids_for_response = torch.tensor([[self.m_tokenizer.eos_token_id]])
-                attention_mask_for_response = torch.tensor([[0]])
+            #response = row_dict['extra_info']['answer'] # raw response
+            #if response:
+            #    model_inputs_for_response = self.m_tokenizer(response, return_tensors="pt")
+            #    input_ids_for_response = model_inputs_for_response.pop("input_ids")
+            #    attention_mask_for_response = model_inputs_for_response.pop("attention_mask")
+            #else:
+            #    input_ids_for_response = torch.tensor([[self.m_tokenizer.eos_token_id]])
+            #    attention_mask_for_response = torch.tensor([[0]])
 
         input_ids, attention_mask = verl_F.postprocess_data(
             input_ids=input_ids,
@@ -294,14 +294,14 @@ class RLHFDataset(Dataset):
             truncation=self.truncation,
         )
 
-        input_ids_for_response, attention_mask_for_response = verl_F.postprocess_data(
-            input_ids=input_ids_for_response,
-            attention_mask=attention_mask_for_response,
-            max_length=512, # hard coded
-            pad_token_id=self.m_tokenizer.pad_token_id,
-            left_pad=False,
-            truncation="right",
-        )
+        #input_ids_for_response, attention_mask_for_response = verl_F.postprocess_data(
+        #    input_ids=input_ids_for_response,
+        #    attention_mask=attention_mask_for_response,
+        #    max_length=512, # hard coded
+        #    pad_token_id=self.m_tokenizer.pad_token_id,
+        #    left_pad=False,
+        #    truncation="right",
+        #)
 
         if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
             from verl.models.transformers.qwen2_vl import get_rope_index
@@ -323,8 +323,8 @@ class RLHFDataset(Dataset):
         row_dict["input_ids"] = input_ids[0]
         row_dict["attention_mask"] = attention_mask[0]
         row_dict["position_ids"] = position_ids[0]
-        row_dict['target_ids'] = input_ids_for_response[0] # not needed if use RL to train translator
-        row_dict['target_attention_mask'] = attention_mask_for_response[0] # not needed if use RL to train translator
+        #row_dict['target_ids'] = input_ids_for_response[0] # not needed if use RL to train translator
+        #row_dict['target_attention_mask'] = attention_mask_for_response[0] # not needed if use RL to train translator
 
         raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
         if len(raw_prompt_ids) > self.max_prompt_length:

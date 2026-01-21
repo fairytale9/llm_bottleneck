@@ -1,37 +1,54 @@
 set -x
 
-export RAY_num_server_call_thread=8
+#export RAY_num_server_call_thread=8 (only for nerc)
 
+########################################################
 # specify configs
+########################################################
+
+# training and test datasets
+dapo_train_path=$HOME/data/dapo17k/train.parquet
+math_train_path=$HOME/data/math/train.parquet
+limo_train_path=$HOME/data/limo/train.parquet
+train_files="['$math_train_path']"
+
 math_test_path=$HOME/data/math/test.parquet
 aime_2024_test_path=$HOME/data/aime2024/test.parquet
-
 test_files="['$math_test_path', '$aime_2024_test_path']"
 
+# M model config
 M_model_path="Qwen/Qwen3-4B"
 M_prompt_length=512
-M_response_length=8192
+M_response_length=6144
 
-m_enable=True
+# m model config
+m_enable=False
+train_m=False
 m_model_path="Qwen/Qwen3-0.6B"
-m_response_length=2048
+m_response_length=1024
 
-experiment_name="qwen3-4b-0.6b-Lout8192-2048-limo"
+# experiment
+train_batch_size=128
+val_batch_size=128
+project_name="rl-M" # wandb
+experiment_name="bs${train_batch_size}-qwen3-4b-Lout${M_response_length}-math" # wandb
 
 
 if [[ "${m_enable,,}" == "true" ]]; then
     translator_n_gpus_per_node=2
+    trainer_n_gpus_per_node=2
 else
     translator_n_gpus_per_node=0
+    trainer_n_gpus_per_node=4
 fi
 
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.train_files=$HOME/data/limo/train.parquet \
+    data.train_files="$train_files" \
     data.val_files="$test_files" \
-    data.train_batch_size=32 \
-    data.val_batch_size=128 \
+    data.train_batch_size=$train_batch_size \
+    data.val_batch_size=$val_batch_size \
     data.max_prompt_length=$M_prompt_length \
     data.max_response_length=$M_response_length \
     data.filter_overlong_prompts=True \
@@ -59,12 +76,13 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     +translator.enable=$m_enable \
+    +translator.train=$train_m \
     translator.model.path=$m_model_path \
     translator.model.lora_rank=0 \
     translator.model.lora_alpha=16 \
-    translator.model.use_remove_padding=False \
-    translator.model.enable_gradient_checkpointing=False \
-    translator.actor.optim.lr=1e-5 \
+    translator.model.use_remove_padding=True \
+    translator.model.enable_gradient_checkpointing=True \
+    translator.actor.optim.lr=1e-6 \
     translator.actor.ppo_mini_batch_size=32 \
     translator.actor.ppo_micro_batch_size_per_gpu=4 \
     translator.actor.use_kl_loss=False \
@@ -87,11 +105,11 @@ python3 -m verl.trainer.main_ppo \
     trainer.val_only=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
-    trainer.project_name='rl-M-m' \
+    trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
-    trainer.n_gpus_per_node=2 \
+    trainer.n_gpus_per_node=$trainer_n_gpus_per_node \
     trainer.translator_n_gpus_per_node=$translator_n_gpus_per_node \
     trainer.nnodes=1 \
-    trainer.save_freq=25 \
+    trainer.save_freq=50 \
     trainer.test_freq=10 \
-    trainer.total_epochs=4 $@
+    trainer.total_epochs=6 $@
