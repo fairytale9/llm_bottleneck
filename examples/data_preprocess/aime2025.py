@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Preprocess the Maxwell-Jia/AIME_2024 dataset
+Preprocess the yentinglin/aime_2025 dataset
 """
 
 import argparse
@@ -26,12 +26,12 @@ from verl.utils.hdfs_io import copy, makedirs
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--local_dir", default="~/data/aime2024")
+    parser.add_argument("--local_dir", default="~/data/aime2025")
     parser.add_argument("--hdfs_dir", default=None)
 
     args = parser.parse_args()
 
-    data_source = "Maxwell-Jia/AIME_2024"
+    data_source = "yentinglin/aime_2025"
     test_dataset = datasets.load_dataset(data_source, split="train")
     
     #instruction_following = "Solve the following math problem step by step. The last line of your response should be of the form Answer: $Answer (without quotes) where $Answer is the answer to the problem.\n\n"
@@ -40,12 +40,12 @@ if __name__ == "__main__":
     # add a row to each data item that represents a unique id
     def make_map_fn(split):
         def process_fn(example, idx):
-            question = example.pop("Problem")
+            question = example.pop("problem")
 
             prompt = question + " " + instruction_following
 
-            answer = example.pop("Solution")
-            solution = str(example.pop("Answer"))
+            answer = example.pop("solution")
+            solution = str(example.pop("answer"))
 
             data = {
                 "data_source": data_source,

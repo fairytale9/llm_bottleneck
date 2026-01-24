@@ -6,20 +6,23 @@ limo_train_path=$HOME/data/limo/train.parquet
 # specify configs
 math_test_path=$HOME/data/math/test.parquet
 aime_2024_test_path=$HOME/data/aime2024/test.parquet
+aime_2025_test_path=$HOME/data/aime2025/test.parquet
+amc23_test_path=$HOME/data/amc23/test.parquet
 gpqa_test_path=$HOME/data/gpqa/test.parquet
 
-test_files="['$deepscaler_train_path']"
+test_files="['$math_test_path', '$aime_2024_test_path', '$aime_2025_test_path', '$amc23_test_path', '$gpqa_test_path']"
 
 M_model_path="Qwen/Qwen3-4B"
 M_prompt_length=1024
 M_response_length=16384
 
-m_enable=False
+m_enable=True
+train_m=False
 m_model_path="/projectnb/noc-lab/ylchen/llm_bottleneck/checkpoints/rl-M-m/qwen3-4b-0.6b-Lout8096-2048-deepscaler/global_step_100/hf_translator"
 m_response_length=2048
 
-project_name="eval-deepscaler"
-experiment_name="qwen3-4b-Lout-${M_response_length}-${m_response_length}"
+project_name="eval-for-paper"
+experiment_name="Mm-Lout-${M_response_length}-${m_response_length}-trained-on-deepscaler-ckp150"
 
 
 if [[ "${m_enable,,}" == "true" ]]; then
@@ -32,7 +35,7 @@ fi
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.train_files=$HOME/data/limo/train.parquet \
+    data.train_files=$HOME/data/math/train.parquet \
     data.val_files="$test_files" \
     data.train_batch_size=128 \
     data.val_batch_size=128 \
@@ -63,10 +66,11 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     +translator.enable=$m_enable \
+    +translator.train=$train_m \
     translator.model.path=$m_model_path \
-    translator.model.use_remove_padding=False \
-    translator.model.enable_gradient_checkpointing=False \
-    translator.actor.optim.lr=1e-5 \
+    translator.model.use_remove_padding=True \
+    translator.model.enable_gradient_checkpointing=True \
+    translator.actor.optim.lr=1e-6 \
     translator.actor.ppo_mini_batch_size=32 \
     translator.actor.ppo_micro_batch_size_per_gpu=4 \
     translator.actor.use_kl_loss=False \

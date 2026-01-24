@@ -1,6 +1,6 @@
 import pandas as pd
 from pathlib import Path
-
+'''
 df = pd.read_parquet("/projectnb/noc-lab/ylchen/data/limo/train.parquet")
 
 # Add raw_question from prompt
@@ -15,12 +15,13 @@ print(df.iloc[0]['raw_question'])
 df.to_parquet("/projectnb/noc-lab/ylchen/data/limo/train.parquet", index=False)
 '''
 
-path = Path("/projectnb/noc-lab/ylchen/data/deepscaler/train.parquet")
+path = Path("/projectnb/noc-lab/ylchen/data/aime2024/test.parquet")
 df = pd.read_parquet(path)
-
+print(len(df))
 # Show a few samples with prompt and raw_question
 print(df.iloc[0]['prompt'])
 print(df.iloc[0]['raw_question'])
-'''
+print(df.iloc[0]['extra_info'])
+
 
 

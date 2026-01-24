@@ -10,7 +10,8 @@ set -x
 dapo_train_path=$HOME/data/dapo17k/train.parquet
 math_train_path=$HOME/data/math/train.parquet
 limo_train_path=$HOME/data/limo/train.parquet
-train_files="['$math_train_path']"
+deepscaler_train_path=$HOME/data/deepscaler/train.parquet
+train_files="['$dapo_train_path']"
 
 math_test_path=$HOME/data/math/test.parquet
 aime_2024_test_path=$HOME/data/aime2024/test.parquet
@@ -19,19 +20,19 @@ test_files="['$math_test_path', '$aime_2024_test_path']"
 # M model config
 M_model_path="Qwen/Qwen3-4B"
 M_prompt_length=512
-M_response_length=6144
+M_response_length=8192
 
 # m model config
-m_enable=False
-train_m=False
+m_enable=True
+train_m=True
 m_model_path="Qwen/Qwen3-0.6B"
 m_response_length=1024
 
 # experiment
-train_batch_size=128
+train_batch_size=64
 val_batch_size=128
-project_name="rl-M" # wandb
-experiment_name="bs${train_batch_size}-qwen3-4b-Lout${M_response_length}-math" # wandb
+project_name="rl-M-m" # wandb
+experiment_name="bs${train_batch_size}-qwen3-4b-0.6b-Lout${M_response_length}-${m_response_length}-dapo17k" # wandb
 
 
 if [[ "${m_enable,,}" == "true" ]]; then
