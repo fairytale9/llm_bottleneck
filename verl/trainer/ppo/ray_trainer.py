@@ -836,8 +836,14 @@ class RayPPOTrainer:
             reward_extra_infos_dict["M_response_length"].extend(response_lengths)
             
             # Decode M response
-            test_batch.non_tensor_batch["raw_M_responses"] = decode_response(test_batch, self.tokenizer, key_name="responses") # prompt + M_response
-            #test_batch.non_tensor_batch["raw_prompts"] = decode_response(test_batch, self.tokenizer, key_name="prompts") # prompt + M_response
+            test_batch.non_tensor_batch["raw_M_responses"] = decode_response(
+                test_batch, self.tokenizer, key_name="responses"
+            )
+            M_reasoning_lengths = [
+                len(self.tokenizer.encode(text, add_special_tokens=False))
+                for text in test_batch.non_tensor_batch["raw_M_responses"]
+            ]
+            reward_extra_infos_dict["M_reasoning_length"].extend(M_reasoning_lengths)
             
             if self.use_translator:
                 # generate m response
@@ -863,21 +869,17 @@ class RayPPOTrainer:
                     m_test_output_gen_batch_padded = self.translator_wg.generate_sequences(m_test_gen_batch_padded)
                 
                 m_test_output_gen_batch = unpad_dataproto(m_test_output_gen_batch_padded, pad_size=m_pad_size)
-                
-                # Monitor progress by printing one sample
-                #translator_responses = decode_response(m_test_output_gen_batch, self.m_tokenizer, key_name="responses")
-                #print(f"\n" + "="*40 + " PROGRESS MONITOR " + "="*40)
-                #print(f"Step: {self.global_steps}")
-                #print(f"Question: {test_batch.non_tensor_batch['raw_question'][0]}")
-                #print(f"M Response: {test_batch.non_tensor_batch['raw_M_responses'][0]}")
-                #print("-"*98 + "\n")
-                #print(f"m Response: {translator_responses[0]}")
-                #print("="*98 + "\n")
 
                 # Pop timing from meta_info to avoid conflict during union
                 m_test_output_gen_batch.meta_info.pop("timing", None)
                 
                 m_test_batch = m_test_batch.union(m_test_output_gen_batch)
+
+                # Track translator response lengths for metrics
+                if "response_mask" not in m_test_batch.batch.keys():
+                    m_test_batch.batch["response_mask"] = compute_response_mask(m_test_batch)
+                m_response_lengths = m_test_batch.batch["response_mask"].sum(dim=1).cpu().tolist()
+                reward_extra_infos_dict["m_response_length"].extend(m_response_lengths)
                 
                 # compute reward using m_test_batch
                 eval_batch = m_test_batch
@@ -958,6 +960,18 @@ class RayPPOTrainer:
                     # choose key with largest N (parsed after '@')
                     best_key = max(mean_keys, key=lambda k: int(k.split("@")[-1]))
                     metric_dict[f"val-core/{data_source}/M_response_length"] = m_resp_metrics[best_key]
+            if "M_reasoning_length" in var2metric2val:
+                m_reasoning_metrics = var2metric2val["M_reasoning_length"]
+                mean_keys = [k for k in m_reasoning_metrics.keys() if k.startswith("mean@")]
+                if mean_keys:
+                    best_key = max(mean_keys, key=lambda k: int(k.split("@")[-1]))
+                    metric_dict[f"val-core/{data_source}/M_reasoning_length"] = m_reasoning_metrics[best_key]
+            if "m_response_length" in var2metric2val:
+                m_resp_len_metrics = var2metric2val["m_response_length"]
+                mean_keys = [k for k in m_resp_len_metrics.keys() if k.startswith("mean@")]
+                if mean_keys:
+                    best_key = max(mean_keys, key=lambda k: int(k.split("@")[-1]))
+                    metric_dict[f"val-core/{data_source}/m_response_length"] = m_resp_len_metrics[best_key]
 
         if len(sample_turns) > 0:
             sample_turns = np.concatenate(sample_turns)

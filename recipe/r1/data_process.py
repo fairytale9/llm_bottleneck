@@ -73,7 +73,7 @@ def build_gpqa_dimond_dataset():
     data_source = "Idavidrein/gpqa"
     print(f"Loading the {data_source} dataset from huggingface...", flush=True)
 
-    dataset = load_dataset(data_source, "gpqa_diamond", split="train")
+    dataset = load_dataset(data_source, "gpqa_main", split="train")
     map_fn = partial(
         example_map_fn, process_fn=process_gpqa_diamond, data_source=data_source, ability="Math", split="test"
     )

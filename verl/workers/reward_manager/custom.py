@@ -69,7 +69,7 @@ class CustomRewardManager(AbstractRewardManager):
 
         # Adaptive length penalty parameters
         self.length_bound = 1000.0
-        self.lambda_factor = 0.0
+        self.lambda_factor = 1.0
         self.lambda_eta = 0.01
     
     def __call__(self, data: DataProto, return_dict: bool = False, is_train: bool = True) -> torch.Tensor | dict[str, Any]:
@@ -186,7 +186,7 @@ class CustomRewardManager(AbstractRewardManager):
                     print("[score]", score)
 
         # Update lambda using batch mean length
-        if is_train and response_lengths:
+        if is_train and response_lengths and False:
             mean_len = sum(response_lengths) / len(response_lengths)
             self.lambda_factor += self.lambda_eta * (mean_len / self.length_bound - 1.0)
             self.lambda_factor = max(0.0, min(1.0, self.lambda_factor))

@@ -11,7 +11,7 @@ dapo_train_path=$HOME/data/dapo17k/train.parquet
 math_train_path=$HOME/data/math/train.parquet
 limo_train_path=$HOME/data/limo/train.parquet
 deepscaler_train_path=$HOME/data/deepscaler/train.parquet
-train_files="['$dapo_train_path']"
+train_files="['$deepscaler_train_path']"
 
 math_test_path=$HOME/data/math/test.parquet
 aime_2024_test_path=$HOME/data/aime2024/test.parquet
@@ -32,7 +32,7 @@ m_response_length=1024
 train_batch_size=64
 val_batch_size=128
 project_name="rl-M-m" # wandb
-experiment_name="bs${train_batch_size}-qwen3-4b-0.6b-Lout${M_response_length}-${m_response_length}-dapo17k" # wandb
+experiment_name="bs${train_batch_size}-qwen3-4b-0.6b-Lout${M_response_length}-${m_response_length}-deepscaler-lambda-1.0" # wandb
 
 
 if [[ "${m_enable,,}" == "true" ]]; then
@@ -113,4 +113,4 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.save_freq=50 \
     trainer.test_freq=10 \
-    trainer.total_epochs=6 $@
+    trainer.total_epochs=3 $@
