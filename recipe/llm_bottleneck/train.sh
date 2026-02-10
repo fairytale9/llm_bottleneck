@@ -43,14 +43,11 @@ wandb_entity="llm-bottleneck"  # wandb entity (team/user)
 project_name="duet" # wandb
 experiment_name="bs-${train_batch_size}-qwen3-4b-0.6b-Lout${M_response_length}-${m_response_length}-deepscaler-gpu" # wandb
 
-# assume one node with 4 gpus
-if [[ "${m_enable,,}" == "true" ]]; then
-    translator_n_gpus_per_node=2
-    trainer_n_gpus_per_node=2
-else
-    translator_n_gpus_per_node=0
-    trainer_n_gpus_per_node=4
-fi
+# All GPUs are shared between actor and translator via vLLM sleep mode.
+# Both models are colocated on the same GPUs; only one vLLM engine is
+# awake at a time (free_cache_engine=True, the default).
+trainer_n_gpus_per_node=4
+translator_n_gpus_per_node=0
 
 
 python3 -m verl.trainer.main_ppo \
