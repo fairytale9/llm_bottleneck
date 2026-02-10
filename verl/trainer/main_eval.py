@@ -17,75 +17,57 @@ The input is a parquet file that contains N generated sequences and (optional) t
 
 """
 
-from collections import defaultdict
-
 import hydra
-import numpy as np
+from verl.utils.fs import copy_local_path_from_hdfs
+from verl.utils.reward_score import math, gsm8k
 import pandas as pd
-import ray
-from omegaconf import OmegaConf
-from tqdm import tqdm
-
-from verl.trainer.ppo.reward import get_custom_reward_fn
-from verl.utils.fs import copy_to_local
-from verl.utils.reward_score import default_compute_score
+import numpy as np
 
 
-@ray.remote
-def process_item(reward_fn, data_source, response_lst, reward_data):
-    ground_truth = reward_data["ground_truth"]
-    score_lst = [reward_fn(data_source, r, ground_truth) for r in response_lst]
-    return data_source, np.mean(score_lst)
+def select_reward_fn(data_source):
+    if data_source == 'DigitalLearningGmbH/MATH-lighteval':
+        return math.compute_score
+    else:
+        raise NotImplementedError
 
 
-@hydra.main(config_path="config", config_name="evaluation", version_base=None)
+@hydra.main(config_path='config', config_name='evaluation', version_base=None)
 def main(config):
-    local_path = copy_to_local(config.data.path, use_shm=config.data.get("use_shm", False))
+    local_path = copy_local_path_from_hdfs(config.data.path)
     dataset = pd.read_parquet(local_path)
+    prompts = dataset[config.data.prompt_key]
     responses = dataset[config.data.response_key]
     data_sources = dataset[config.data.data_source_key]
     reward_model_data = dataset[config.data.reward_model_key]
 
+    passes = 0
+
     total = len(dataset)
+    pass_lst = []
+    for i in range(total):
+        response_lst = responses[i]
+        data_source = data_sources[i]
+        # select reward score based on data_source
+        prompt = prompts[i]
+        reward_data = reward_model_data[i]
+        reward_fn = select_reward_fn(data_source)
+        ground_truth = reward_data['ground_truth']
+        score_lst = []
+        for r in response_lst:
+            score = reward_fn(r, ground_truth)
+            score_lst.append(score)
 
-    # Initialize Ray
-    if not ray.is_initialized():
-        ray.init(**OmegaConf.to_container(config.ray_kwargs.get("ray_init", {})))
+        max_score = np.max(score_lst)
+        pass_lst.append(max_score)
+        if max_score == 1:
+            passes += 1
 
-    # evaluate test_score based on data source
-    data_source_reward = defaultdict(list)
-    compute_score = get_custom_reward_fn(config)
-    
-    # Fallback to default_compute_score if no custom reward function is provided
-    if compute_score is None:
-        compute_score = default_compute_score
-        print("No custom reward function specified, using default_compute_score")
-
-    # Create remote tasks
-    remote_tasks = [
-        process_item.remote(compute_score, data_sources[i], responses[i], reward_model_data[i]) for i in range(total)
-    ]
-
-    # Process results as they come in
-    with tqdm(total=total) as pbar:
-        while len(remote_tasks) > 0:
-            # Use ray.wait to get completed tasks
-            done_ids, remote_tasks = ray.wait(remote_tasks)
-            for result_id in done_ids:
-                data_source, score = ray.get(result_id)
-                data_source_reward[data_source].append(score)
-                pbar.update(1)
-
-    metric_dict = {}
-    for data_source, rewards in data_source_reward.items():
-        dataset["m_eval_results"] = rewards
-        metric_dict[f"test_score/{data_source}"] = np.mean(rewards)
-
-    print(metric_dict)
+    print(f'Eval results: {passes / total}')
 
     # save dataset with eval results
+    dataset["m_eval_results"] = pass_lst
     dataset.to_parquet(config.data.path)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

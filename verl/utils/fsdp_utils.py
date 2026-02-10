@@ -123,15 +123,23 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
         for layer_class in fsdp_transformer_layer_cls_to_wrap:
             transformer_cls = get_module_class_from_name(module, layer_class)
             if transformer_cls is None:
-                raise Exception("Could not find the transformer layer class to wrap in the model.")
+                import warnings
+
+                warnings.warn(
+                    f"Could not find the transformer layer class '{layer_class}' to wrap in the model. "
+                    f"Skipping this class. This can happen when _no_split_modules includes classes "
+                    f"from other model variants (e.g., vision modules in a text-only model).",
+                    stacklevel=1,
+                )
             else:
                 transformer_cls_to_wrap.add(transformer_cls)
 
-        transformer_policy = functools.partial(
-            transformer_auto_wrap_policy,
-            transformer_layer_cls=transformer_cls_to_wrap,
-        )
-        policies.append(transformer_policy)
+        if len(transformer_cls_to_wrap) > 0:
+            transformer_policy = functools.partial(
+                transformer_auto_wrap_policy,
+                transformer_layer_cls=transformer_cls_to_wrap,
+            )
+            policies.append(transformer_policy)
 
     if len(policies) > 0:
         auto_wrap_policy = functools.partial(_or_policy, policies=policies)

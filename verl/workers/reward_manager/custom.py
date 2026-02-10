@@ -50,16 +50,24 @@ class CustomRewardManager(AbstractRewardManager):
     baselines and adaptive length penalty.
     """
     
-    def __init__(self, tokenizer, m_tokenizer, num_examine, compute_score=None, reward_fn_key="data_source"):
+    def __init__(self, tokenizer, m_tokenizer, num_examine, compute_score=None, reward_fn_key="data_source",
+                 length_bound=1000.0, length_penalty_clip=True, length_penalty_schedule="adaptive",
+                 length_penalty_lambda=0.0, length_penalty_eta=0.01, use_marginal_utility=True):
         """
         Initialize the Custom Reward Manager.
-        
+
         Args:
             tokenizer: The tokenizer used to decode token IDs into text.
             num_examine: The number of batches of decoded responses to print to the console for debugging purpose.
             compute_score: A function to compute the reward score. If None, `default_compute_score` will be used.
             reward_fn_key: The key used to access the data source in the non-tensor batch data. Defaults to
                 "data_source".
+            length_bound: The bound B in the length penalty term L/B.
+            length_penalty_clip: Whether to clip lambda to [0, 1].
+            length_penalty_schedule: "adaptive" (lambda updated each batch) or "constant" (fixed lambda).
+            length_penalty_lambda: Initial lambda for adaptive schedule, or the fixed lambda for constant schedule.
+            length_penalty_eta: Learning rate for adaptive lambda updates.
+            use_marginal_utility: If True, reward = r_Mm - r_m (marginal utility). If False, reward = r_Mm.
         """
         self.tokenizer = tokenizer  # Store the tokenizer for decoding token IDs
         self.m_tokenizer = m_tokenizer
@@ -67,10 +75,13 @@ class CustomRewardManager(AbstractRewardManager):
         self.compute_score = compute_score or default_compute_score
         self.reward_fn_key = reward_fn_key  # Store the key for accessing the data source
 
-        # Adaptive length penalty parameters
-        self.length_bound = 1000.0
-        self.lambda_factor = 1.0
-        self.lambda_eta = 0.01
+        # Length penalty parameters
+        self.length_bound = float(length_bound)
+        self.length_penalty_clip = length_penalty_clip
+        self.length_penalty_schedule = length_penalty_schedule
+        self.lambda_factor = float(length_penalty_lambda)
+        self.lambda_eta = float(length_penalty_eta)
+        self.use_marginal_utility = use_marginal_utility
     
     def __call__(self, data: DataProto, return_dict: bool = False, is_train: bool = True) -> torch.Tensor | dict[str, Any]:
         """We will expand this function gradually based on the available datasets"""
@@ -136,7 +147,7 @@ class CustomRewardManager(AbstractRewardManager):
                 r_mm_val = r_mm.item() if isinstance(r_mm, torch.Tensor) else float(r_mm)
                 r_m_val = r_m.item() if isinstance(r_m, torch.Tensor) else float(r_m)
 
-                reward = r_mm_val - r_m_val
+                reward = r_mm_val - r_m_val if self.use_marginal_utility else r_mm_val
             else:
                 score = self.compute_score(
                     data_source=data_source,
@@ -185,11 +196,12 @@ class CustomRewardManager(AbstractRewardManager):
                 else:
                     print("[score]", score)
 
-        # Update lambda using batch mean length
-        if is_train and response_lengths and False:
+        # Update lambda using batch mean length (only for adaptive schedule)
+        if is_train and response_lengths and self.length_penalty_schedule == "adaptive":
             mean_len = sum(response_lengths) / len(response_lengths)
             self.lambda_factor += self.lambda_eta * (mean_len / self.length_bound - 1.0)
-            self.lambda_factor = max(0.0, min(1.0, self.lambda_factor))
+            if self.length_penalty_clip:
+                self.lambda_factor = max(0.0, min(1.0, self.lambda_factor))
         
         if return_dict:
             return {

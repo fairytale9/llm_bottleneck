@@ -55,7 +55,8 @@ class Tracking:
             settings = None
             if config and config["trainer"].get("wandb_proxy", None):
                 settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
-            wandb.init(project=project_name, entity="llm-bottleneck", name=experiment_name, config=config, settings=settings)
+            entity = config["trainer"].get("wandb_entity", None) if config else None
+            wandb.init(project=project_name, entity=entity, name=experiment_name, config=config, settings=settings)
             self.logger["wandb"] = wandb
 
         if "trackio" in default_backend:

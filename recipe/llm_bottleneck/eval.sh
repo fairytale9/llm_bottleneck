@@ -9,21 +9,22 @@ aime_2024_test_path=$HOME/data/aime2024/test.parquet
 aime_2025_test_path=$HOME/data/aime2025/test.parquet
 amc23_test_path=$HOME/data/amc23/test.parquet
 gpqa_diamond_test_path=$HOME/data/gpqa_diamond/test.parquet
-gpqa_main_test_path=$HOME/data/gpqa_main/test.parquet
+#gpqa_main_test_path=$HOME/data/gpqa_main/test.parquet
 
-test_files="['$math_test_path', '$aime_2024_test_path', '$aime_2025_test_path', '$amc23_test_path', '$gpqa_diamond_test_path', '$gpqa_main_test_path']"
+test_files="['$math_test_path', '$aime_2024_test_path', '$aime_2025_test_path', '$amc23_test_path', '$gpqa_diamond_test_path']"
 
-M_model_path="/projectnb/noc-lab/ylchen/llm_bottleneck/checkpoints/rl-M-m/bs-64-qwen3-4b-0.6b-Lout4096-1024-math/global_step_50/hf_actor"
+M_model_path="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 M_prompt_length=1024
-M_response_length=16384
+M_response_length=8192
 
 m_enable=True
 train_m=False
-m_model_path="/projectnb/noc-lab/ylchen/llm_bottleneck/checkpoints/rl-M-m/bs-64-qwen3-4b-0.6b-Lout4096-1024-math/global_step_50/hf_translator"
+m_model_path="Qwen/Qwen3-0.6B"
 m_response_length=2048
 
-project_name="eval-for-paper"
-experiment_name="Mm-Lout-${M_response_length}-${m_response_length}-trained-on-math-ckp50"
+wandb_entity="llm-bottleneck"
+project_name="duet"
+experiment_name="Mm-Lout-${M_response_length}-${m_response_length}-deepseek-distilled-7b-qwen-0.6b"
 
 
 if [[ "${m_enable,,}" == "true" ]]; then
@@ -94,6 +95,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.val_only=True \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
+    +trainer.wandb_entity=$wandb_entity \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
     trainer.n_gpus_per_node=$trainer_n_gpus_per_node \

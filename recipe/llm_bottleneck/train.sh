@@ -1,7 +1,6 @@
 set -x
 
-#export RAY_num_server_call_thread=8 (only for nerc)
-
+export RAY_ENABLE_DASHBOARD=0
 ########################################################
 # specify configs
 ########################################################
@@ -11,6 +10,7 @@ dapo_train_path=$HOME/data/dapo17k/train.parquet
 math_train_path=$HOME/data/math/train.parquet
 limo_train_path=$HOME/data/limo/train.parquet
 deepscaler_train_path=$HOME/data/deepscaler/train.parquet
+deepmath_train_path=$HOME/data/deepmath/train.parquet
 train_files="['$deepscaler_train_path']"
 
 math_test_path=$HOME/data/math/test.parquet
@@ -28,13 +28,22 @@ train_m=True
 m_model_path="Qwen/Qwen3-0.6B"
 m_response_length=1024
 
+# reward / length penalty config
+length_bound=1000                    # B in the penalty term L/B
+length_penalty_clip=True             # clip lambda to [0, 1]
+length_penalty_schedule="adaptive"   # "adaptive" or "constant"
+length_penalty_lambda=0.0            # fixed lambda (constant) or initial lambda (adaptive)
+length_penalty_eta=0.01              # learning rate for adaptive lambda updates
+use_marginal_utility=True            # True: r_Mm - r_m; False: r_Mm
+
 # experiment
 train_batch_size=64
 val_batch_size=128
-project_name="rl-M-m" # wandb
-experiment_name="bs${train_batch_size}-qwen3-4b-0.6b-Lout${M_response_length}-${m_response_length}-deepscaler-lambda-1.0" # wandb
+wandb_entity="llm-bottleneck"  # wandb entity (team/user)
+project_name="duet" # wandb
+experiment_name="bs-${train_batch_size}-qwen3-4b-0.6b-Lout${M_response_length}-${m_response_length}-deepscaler-gpu" # wandb
 
-
+# assume one node with 4 gpus
 if [[ "${m_enable,,}" == "true" ]]; then
     translator_n_gpus_per_node=2
     trainer_n_gpus_per_node=2
@@ -101,16 +110,23 @@ python3 -m verl.trainer.main_ppo \
     translator.rollout.n=4 \
     translator.rollout.max_num_batched_tokens=20000 \
     reward_model.reward_manager='custom' \
+    +reward_model.reward_kwargs.length_bound=$length_bound \
+    +reward_model.reward_kwargs.length_penalty_clip=$length_penalty_clip \
+    +reward_model.reward_kwargs.length_penalty_schedule=$length_penalty_schedule \
+    +reward_model.reward_kwargs.length_penalty_lambda=$length_penalty_lambda \
+    +reward_model.reward_kwargs.length_penalty_eta=$length_penalty_eta \
+    +reward_model.reward_kwargs.use_marginal_utility=$use_marginal_utility \
     algorithm.use_kl_in_reward=True \
     trainer.val_before_train=False \
     trainer.val_only=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
+    +trainer.wandb_entity=$wandb_entity \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
     trainer.n_gpus_per_node=$trainer_n_gpus_per_node \
     trainer.translator_n_gpus_per_node=$translator_n_gpus_per_node \
     trainer.nnodes=1 \
-    trainer.save_freq=50 \
+    trainer.save_freq=500 \
     trainer.test_freq=10 \
-    trainer.total_epochs=3 $@
+    trainer.total_epochs=2 $@
