@@ -18,7 +18,7 @@ aime_2024_test_path=$HOME/data/aime2024/test.parquet
 test_files="['$math_test_path', '$aime_2024_test_path']"
 
 # M model config
-M_model_path="Qwen/Qwen3-8B" #deepseek-ai/DeepSeek-R1-Distill-Llama-8B
+M_model_path="Qwen/Qwen3-4B"
 M_prompt_length=512
 M_response_length=8192
 
@@ -39,16 +39,8 @@ use_marginal_utility=True            # True: r_Mm - r_m; False: r_Mm
 # experiment
 train_batch_size=64
 val_batch_size=128
-wandb_entity="llm-bottleneck"  # wandb entity (team/user)
-project_name="duet" # wandb
-experiment_name="bs-${train_batch_size}-qwen-8b-0.6b-Lout${M_response_length}-${m_response_length}-deepmath-gpu" # wandb
-
-# All GPUs are shared between actor and translator.
-# Actor uses vLLM sleep mode (free_cache_engine=True, the default).
-# Translator keeps its vLLM engine always resident (free_cache_engine=False)
-# because CuMemAllocator only supports one sleep-mode engine per process.
-trainer_n_gpus_per_node=4
-translator_n_gpus_per_node=0
+project_name="DUET" # wandb
+experiment_name="bs-${train_batch_size}-qwen-4b-0.6b-Lout${M_response_length}-${m_response_length}-trained_on_deepscaler" # wandb
 
 
 python3 -m verl.trainer.main_ppo \
@@ -122,12 +114,11 @@ python3 -m verl.trainer.main_ppo \
     trainer.val_only=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
-    +trainer.wandb_entity=$wandb_entity \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
-    trainer.n_gpus_per_node=$trainer_n_gpus_per_node \
-    trainer.translator_n_gpus_per_node=$translator_n_gpus_per_node \
+    trainer.n_gpus_per_node=4 \
+    trainer.translator_n_gpus_per_node=0 \
     trainer.nnodes=1 \
-    trainer.save_freq=500 \
+    trainer.save_freq=50 \
     trainer.test_freq=10 \
-    trainer.total_epochs=10 $@
+    trainer.total_epochs=3 $@
