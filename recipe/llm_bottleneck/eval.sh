@@ -3,36 +3,28 @@ set -x
 deepscaler_train_path=$HOME/data/deepscaler/train.parquet
 dapo_train_path=$HOME/data/dapo17k/train.parquet
 limo_train_path=$HOME/data/limo/train.parquet
+
 # specify configs
 math_test_path=$HOME/data/math/test.parquet
 aime_2024_test_path=$HOME/data/aime2024/test.parquet
 aime_2025_test_path=$HOME/data/aime2025/test.parquet
 amc23_test_path=$HOME/data/amc23/test.parquet
 gpqa_diamond_test_path=$HOME/data/gpqa_diamond/test.parquet
-#gpqa_main_test_path=$HOME/data/gpqa_main/test.parquet
 
 test_files="['$math_test_path', '$aime_2024_test_path', '$aime_2025_test_path', '$amc23_test_path', '$gpqa_diamond_test_path']"
 
-M_model_path="Qwen/Qwen3-8B" #deepseek-ai/DeepSeek-R1-Distill-Llama-8B
+M_model_path="Qwen/Qwen3-4B"
 M_prompt_length=1024
 M_response_length=16384
 
 m_enable=False
 train_m=False
-m_model_path="Qwen/Qwen3-8B"
+m_model_path="Qwen/Qwen3-0.6B"
 m_response_length=2048
 
-wandb_entity="llm-bottleneck"
-project_name="duet"
-experiment_name="Mm-Lout-${M_response_length}-${m_response_length}-qwen3-8b-temp-0.6"
+project_name="DUET"
+experiment_name="Mm-Lout-${M_response_length}-${m_response_length}-qwen3-4b-0.6b"
 
-
-# All GPUs are shared between actor and translator.
-# Actor uses vLLM sleep mode (free_cache_engine=True, the default).
-# Translator keeps its vLLM engine always resident (free_cache_engine=False)
-# because CuMemAllocator only supports one sleep-mode engine per process.
-trainer_n_gpus_per_node=4
-translator_n_gpus_per_node=0
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -101,11 +93,10 @@ python3 -m verl.trainer.main_ppo \
     trainer.val_only=True \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb"]' \
-    +trainer.wandb_entity=$wandb_entity \
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
-    trainer.n_gpus_per_node=$trainer_n_gpus_per_node \
-    trainer.translator_n_gpus_per_node=$translator_n_gpus_per_node  \
+    trainer.n_gpus_per_node=4 \
+    trainer.translator_n_gpus_per_node=0 \
     trainer.nnodes=1 \
     trainer.save_freq=50 \
     trainer.test_freq=10 \
