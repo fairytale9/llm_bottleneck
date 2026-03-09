@@ -31,7 +31,7 @@ def extract_solution(solution_str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--local_dir", default="~/data/math")
+    parser.add_argument("--local_dir", default="~/data/math_strategy")
     parser.add_argument("--hdfs_dir", default=None)
 
     args = parser.parse_args()
@@ -40,47 +40,55 @@ if __name__ == "__main__":
     # Use mirror repo: DigitalLearningGmbH/MATH-lighteval
     data_source = "DigitalLearningGmbH/MATH-lighteval"
     print(f"Loading the {data_source} dataset from huggingface...", flush=True)
-    dataset = datasets.load_dataset("HuggingFaceH4/MATH-500", trust_remote_code=True)
+    dataset = datasets.load_dataset("DigitalLearningGmbH/MATH-lighteval", trust_remote_code=True)
 
-    #train_dataset = dataset["train"]
+    train_dataset = dataset["train"]
     test_dataset = dataset["test"]
 
-    #instruction_following = "Let's produce a high-level solution strategy that explains *how* to solve the problem, not *the solution itself*."
-    instruction_following = "Let's think step by step and output the final answer within \\boxed{}."
+    instruction_following_strategy = """
+You are a PLANNING MODULE.
+You are NOT allowed to compute or derive results.
+Your responsibility is to describe a reusable solution template.
+
+Another module will execute the plan later.
+
+Question:
+"""
+    instruction_following_answer = "Let's think step by step and output the final answer within \\boxed{}."
 
     # add a row to each data item that represents a unique id
     def make_map_fn(split):
         def process_fn(example, idx):
             question = example.pop("problem")
 
-            prompt = question + " " + instruction_following
+            prompt = instruction_following_strategy + " " + question
 
             answer = example.pop("solution")
-            solution = str(example.pop("answer"))
+            solution = extract_solution(answer)
             data = {
                 "data_source": data_source,
                 "prompt": [{"role": "user", "content": prompt}],
                 "ability": "math",
                 "reward_model": {"style": "rule", "ground_truth": solution},
                 "extra_info": {"split": split, "index": idx, "answer": answer, "question": question},
-                "raw_question": question,
+                "raw_question": question + " " + instruction_following_answer,
             }
             return data
 
         return process_fn
 
-    #train_dataset = train_dataset.map(function=make_map_fn("train"), with_indices=True)
+    train_dataset = train_dataset.map(function=make_map_fn("train"), with_indices=True)
     test_dataset = test_dataset.map(function=make_map_fn("test"), with_indices=True)
 
     local_dir = os.path.expanduser(args.local_dir)
     hdfs_dir = args.hdfs_dir
 
-    #train_dataset.to_parquet(os.path.join(local_dir, "train.parquet"))
+    train_dataset.to_parquet(os.path.join(local_dir, "train.parquet"))
     test_dataset.to_parquet(os.path.join(local_dir, "test.parquet"))
     # Save one example as JSON for reference
-    #example = train_dataset[0]
-    #with open(os.path.join(local_dir, "train_example.json"), "w") as f:
-    #    json.dump(example, f, indent=2)
+    example = train_dataset[0]
+    with open(os.path.join(local_dir, "train_example.json"), "w") as f:
+        json.dump(example, f, indent=2)
     example = test_dataset[0]
     with open(os.path.join(local_dir, "test_example.json"), "w") as f:
         json.dump(example, f, indent=2)

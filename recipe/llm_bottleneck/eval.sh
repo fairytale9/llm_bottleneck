@@ -13,27 +13,26 @@ gpqa_diamond_test_path=$HOME/data/gpqa_diamond/test.parquet
 
 test_files="['$math_test_path', '$aime_2024_test_path', '$aime_2025_test_path', '$amc23_test_path', '$gpqa_diamond_test_path']"
 
-M_model_path="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+M_model_path="Qwen/Qwen3-8B" #deepseek-ai/DeepSeek-R1-Distill-Llama-8B
 M_prompt_length=1024
-M_response_length=8192
+M_response_length=16384
 
-m_enable=True
+m_enable=False
 train_m=False
-m_model_path="Qwen/Qwen3-0.6B"
+m_model_path="Qwen/Qwen3-8B"
 m_response_length=2048
 
 wandb_entity="llm-bottleneck"
 project_name="duet"
-experiment_name="Mm-Lout-${M_response_length}-${m_response_length}-deepseek-distilled-7b-qwen-0.6b"
+experiment_name="Mm-Lout-${M_response_length}-${m_response_length}-qwen3-8b-temp-0.6"
 
 
-if [[ "${m_enable,,}" == "true" ]]; then
-    translator_n_gpus_per_node=2
-    trainer_n_gpus_per_node=2
-else
-    translator_n_gpus_per_node=0
-    trainer_n_gpus_per_node=4
-fi
+# All GPUs are shared between actor and translator.
+# Actor uses vLLM sleep mode (free_cache_engine=True, the default).
+# Translator keeps its vLLM engine always resident (free_cache_engine=False)
+# because CuMemAllocator only supports one sleep-mode engine per process.
+trainer_n_gpus_per_node=4
+translator_n_gpus_per_node=0
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -62,9 +61,14 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
+    actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.n=4 \
     actor_rollout_ref.rollout.max_num_batched_tokens=20000 \
+    actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
+    actor_rollout_ref.rollout.val_kwargs.do_sample=True \
+    actor_rollout_ref.rollout.val_kwargs.top_k=20 \
+    actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     +translator.enable=$m_enable \
@@ -86,7 +90,9 @@ python3 -m verl.trainer.main_ppo \
     translator.rollout.response_length=$m_response_length \
     translator.rollout.tensor_model_parallel_size=1 \
     translator.rollout.name=vllm \
-    translator.rollout.gpu_memory_utilization=0.6 \
+    translator.rollout.gpu_memory_utilization=0.25 \
+    translator.rollout.free_cache_engine=False \
+    translator.rollout.enforce_eager=True \
     translator.rollout.n=1 \
     translator.rollout.max_num_batched_tokens=20000 \
     reward_model.reward_manager='custom' \

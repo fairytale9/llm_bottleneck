@@ -7,7 +7,7 @@ export RAY_ENABLE_DASHBOARD=0
 
 # training and test datasets
 dapo_train_path=$HOME/data/dapo17k/train.parquet
-math_train_path=$HOME/data/math/train.parquet
+math_train_path=$HOME/data/math_strategy/train.parquet
 limo_train_path=$HOME/data/limo/train.parquet
 deepscaler_train_path=$HOME/data/deepscaler/train.parquet
 deepmath_train_path=$HOME/data/deepmath/train.parquet
@@ -18,7 +18,7 @@ aime_2024_test_path=$HOME/data/aime2024/test.parquet
 test_files="['$math_test_path', '$aime_2024_test_path']"
 
 # M model config
-M_model_path="Qwen/Qwen3-4B"
+M_model_path="Qwen/Qwen3-8B" #deepseek-ai/DeepSeek-R1-Distill-Llama-8B
 M_prompt_length=512
 M_response_length=8192
 
@@ -41,11 +41,12 @@ train_batch_size=64
 val_batch_size=128
 wandb_entity="llm-bottleneck"  # wandb entity (team/user)
 project_name="duet" # wandb
-experiment_name="bs-${train_batch_size}-qwen3-4b-0.6b-Lout${M_response_length}-${m_response_length}-deepscaler-gpu" # wandb
+experiment_name="bs-${train_batch_size}-qwen-8b-0.6b-Lout${M_response_length}-${m_response_length}-deepmath-gpu" # wandb
 
-# All GPUs are shared between actor and translator via vLLM sleep mode.
-# Both models are colocated on the same GPUs; only one vLLM engine is
-# awake at a time (free_cache_engine=True, the default).
+# All GPUs are shared between actor and translator.
+# Actor uses vLLM sleep mode (free_cache_engine=True, the default).
+# Translator keeps its vLLM engine always resident (free_cache_engine=False)
+# because CuMemAllocator only supports one sleep-mode engine per process.
 trainer_n_gpus_per_node=4
 translator_n_gpus_per_node=0
 
@@ -66,7 +67,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=32 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -74,13 +75,14 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
+    actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.n=4 \
     actor_rollout_ref.rollout.max_num_batched_tokens=20000 \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     +translator.enable=$m_enable \
     +translator.train=$train_m \
@@ -103,7 +105,9 @@ python3 -m verl.trainer.main_ppo \
     translator.rollout.response_length=$m_response_length \
     translator.rollout.tensor_model_parallel_size=1 \
     translator.rollout.name=vllm \
-    translator.rollout.gpu_memory_utilization=0.6 \
+    translator.rollout.gpu_memory_utilization=0.25 \
+    translator.rollout.free_cache_engine=False \
+    translator.rollout.enforce_eager=True \
     translator.rollout.n=4 \
     translator.rollout.max_num_batched_tokens=20000 \
     reward_model.reward_manager='custom' \
@@ -126,4 +130,4 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.save_freq=500 \
     trainer.test_freq=10 \
-    trainer.total_epochs=2 $@
+    trainer.total_epochs=10 $@
