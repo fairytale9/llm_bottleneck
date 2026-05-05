@@ -1,4 +1,4 @@
-# When Less is More: Efficient Inference via Collaborative Reasoning
+# When Less is Enough: Efficient Inference via Collaborative Reasoning
 
 [![arXiv](https://img.shields.io/badge/arXiv-2605.01111-red)](https://arxiv.org/abs/2605.01111v1)
 
