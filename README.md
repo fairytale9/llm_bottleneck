@@ -1,5 +1,7 @@
 # When Less is Enough: Efficient Inference via Collaborative Reasoning
 
+[![arXiv](https://img.shields.io/badge/arXiv-2605.01111-red)](https://arxiv.org/abs/2605.01111v1)
+
 ## Overview
 
 This repository implements **DUET** (**D**ual-model **E**fficient **T**wo-stage inference), a collaborative inference framework in which a capable model **M** and a lightweight model **m** work together to solve a task. DUET decomposes inference into two stages: **M** produces a reasoning signal, and **m** interprets this signal to generate the final answer — keeping reasoning-intensive computation on the capable model while delegating non–reasoning-intensive work to the lightweight model.
@@ -104,3 +106,11 @@ bash recipe/llm_bottleneck/eval.sh
 - AIME 2025
 - AMC 23
 - GPQA Diamond
+
+---
+
+## Citation
+
+The BibTeX entry will be added once the paper is indexed on Google Scholar. In the meantime, please cite the arXiv preprint: [arXiv:2605.01111](https://arxiv.org/abs/2605.01111v1).
+
+*(Full citation coming soon — will be updated later.)*
